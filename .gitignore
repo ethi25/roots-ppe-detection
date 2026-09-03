@@ -1,0 +1,32 @@
+# Node / Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+.env
+.env.local
+
+# Python / PyTorch
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+venv/
+.venv/
+env/
+
+# Large Datasets & Video Files
+*.mp4
+*.avi
+*.mov
+*.mkv
+backend/uploads/
+backend/processed/
+backend/snapshots/
+backend/extracted_frames/
+backend/dataset/raw_images/
+backend/dataset/raw_labels/
+backend/runs/
+
+# Logs
+*.log

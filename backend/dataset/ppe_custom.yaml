@@ -1,0 +1,14 @@
+names:
+  0: glove
+  1: goggles
+  2: helmet
+  3: mask
+  4: no_glove
+  5: no_goggles
+  6: no_helmet
+  7: no_mask
+  8: no_shoes
+  9: shoes
+path: C:\Users\Ethirajan\.gemini\antigravity-ide\scratch\ppe-compliance-detector\backend\dataset
+train: images/train
+val: images/val

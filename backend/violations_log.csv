@@ -1,0 +1,17 @@
+timestamp,video_name,frame_number,track_id,violation_items,snapshot_path
+2026-09-01T07:14:33.160174,temp_trimmed_1788227034.mp4,52,1,"Helmet,Mask,Shoes",/static/snapshots/violation_track1_frame52_1788227073.jpg
+2026-09-01T07:15:49.447797,temp_trimmed_1788227034.mp4,313,3,"Helmet,Mask,Shoes",/static/snapshots/violation_track3_frame313_1788227149.jpg
+2026-09-01T07:17:36.512843,temp_trimmed_1788227225.mp4,52,1,"Helmet,Mask,Shoes",/static/snapshots/violation_track1_frame52_1788227256.jpg
+2026-09-01T07:18:39.723868,temp_trimmed_1788227225.mp4,313,3,"Helmet,Mask,Shoes",/static/snapshots/violation_track3_frame313_1788227319.jpg
+2026-09-01T07:25:55.058557,temp_trimmed_1788227719.mp4,52,1,"Helmet,Mask,Shoes",/static/snapshots/violation_track1_frame52_1788227755.jpg
+2026-09-01T07:26:54.609381,temp_trimmed_1788227719.mp4,313,3,"Helmet,Mask,Shoes",/static/snapshots/violation_track3_frame313_1788227814.jpg
+2026-09-01T10:12:43.496406,temp_trimmed_1788237723.mp4,52,1,"Helmet,Mask,Shoes",/static/snapshots/violation_track1_frame52_1788237763.jpg
+2026-09-01T10:13:44.356728,temp_trimmed_1788237723.mp4,313,3,"Helmet,Mask,Shoes",/static/snapshots/violation_track3_frame313_1788237824.jpg
+2026-09-01T10:52:54.660703,temp_trimmed_1788240148.mp4,5,0.17,1,"Helmet,Mask,Shoes",/static/snapshots/violation_track1_frame5_1788240174.jpg
+2026-09-01T10:59:37.404169,temp_trimmed_1788240542.mp4,52,2.08,1,"Helmet,Mask,Shoes",/static/snapshots/violation_track1_frame52_1788240577.jpg
+2026-09-01T11:00:46.051365,temp_trimmed_1788240542.mp4,313,12.52,3,"Helmet,Mask,Shoes",/static/snapshots/violation_track3_frame313_1788240646.jpg
+2026-09-01T11:30:18.224069,temp_trimmed_1788242403.mp4,5,0.17,1,"Helmet,Mask,Shoes",/static/snapshots/violation_track1_frame5_1788242418.jpg
+2026-09-01T11:33:47.517527,temp_trimmed_1788242617.mp4,5,0.17,1,"Helmet,Mask,Shoes",/static/snapshots/violation_track1_frame5_1788242627.jpg
+2026-09-02T07:56:55.639121,temp_trimmed_1788316000.mp4,5,0.17,1,"Helmet,Mask,Shoes",/static/snapshots/violation_track1_frame5_1788316015.jpg
+2026-09-02T08:04:35.711822,temp_trimmed_1788316453.mp4,5,0.17,1,"Helmet,Mask,Shoes",/static/snapshots/violation_track1_frame5_1788316475.jpg
+2026-09-02T09:46:47.140897,temp_trimmed_1788322591.mp4,5,0.17,1,"Helmet,Mask,Shoes",/static/snapshots/violation_track1_frame5_1788322607.jpg
