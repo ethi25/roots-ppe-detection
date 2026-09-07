@@ -6,15 +6,23 @@ import random
 import yaml
 from ultralytics import YOLO
 
-# Paths configuration
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 BACKEND_DIR = os.path.join(BASE_DIR, "backend")
 DATASET_DIR = os.path.join(BACKEND_DIR, "dataset")
 
-VIDEO_PATHS = [
-    r"C:\Users\Ethirajan\Videos\training(1).mp4",
-    r"C:\Users\Ethirajan\Videos\training(2).mp4"
-]
+VIDEOS_DIR = r"C:\Users\Ethirajan\Videos"
+VIDEO_PATHS = []
+
+if os.path.exists(VIDEOS_DIR):
+    for f in os.listdir(VIDEOS_DIR):
+        if f.endswith(".mp4") and "training" in f:
+            VIDEO_PATHS.append(os.path.join(VIDEOS_DIR, f))
+
+if not VIDEO_PATHS:
+    VIDEO_PATHS = [
+        r"C:\Users\Ethirajan\Videos\training(1).mp4",
+        r"C:\Users\Ethirajan\Videos\training(2).mp4"
+    ]
 
 PPE_CLASSES = {
     0: 'glove',
@@ -38,36 +46,37 @@ def denoise_frame(frame, clahe_clip=2.5):
     return cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
 
 def extract_and_auto_annotate():
-    print("Step 1: Extracting frames & auto-annotating from CCTV clips...")
+    print(f"Step 1: Extracting & auto-annotating frames from {len(VIDEO_PATHS)} CCTV clips...")
     
     extracted_img_dir = os.path.join(DATASET_DIR, "raw_images")
     extracted_lbl_dir = os.path.join(DATASET_DIR, "raw_labels")
     
+    # Remove old dataset directory & cache files cleanly
     if os.path.exists(DATASET_DIR):
-        shutil.rmtree(DATASET_DIR)
-        
+        try:
+            shutil.rmtree(DATASET_DIR)
+        except Exception as e:
+            print("Cleanup info:", e)
+            
     os.makedirs(extracted_img_dir, exist_ok=True)
     os.makedirs(extracted_lbl_dir, exist_ok=True)
 
-    # Load pre-trained medium model for auto-labeling
     model_path = os.path.join(BACKEND_DIR, "yolov8m-ppe.pt")
     if not os.path.exists(model_path):
         model_path = os.path.join(BACKEND_DIR, "yolov8n-ppe.pt")
     auto_model = YOLO(model_path)
 
-    frame_count = 0
     saved_count = 0
 
     for vid_idx, vid_path in enumerate(VIDEO_PATHS):
         if not os.path.exists(vid_path):
-            print(f"Warning: Video not found: {vid_path}")
             continue
             
         cap = cv2.VideoCapture(vid_path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        frame_step = int(fps * 1.5) # Extract frame every 1.5s
+        frame_step = int(fps * 2.0)
         
-        print(f"Extracting from: {vid_path} (step: {frame_step} frames)")
+        print(f"[{vid_idx+1}/{len(VIDEO_PATHS)}] Extracting from: {os.path.basename(vid_path)}")
 
         curr_frame = 0
         while True:
@@ -76,13 +85,11 @@ def extract_and_auto_annotate():
                 break
                 
             if curr_frame % frame_step == 0:
-                clean = denoise_frame(frame, clahe_clip=2.0)
+                clean = denoise_frame(frame, clahe_clip=2.5)
                 img_name = f"cctv{vid_idx+1}_frame_{saved_count:04d}.jpg"
                 img_path = os.path.join(extracted_img_dir, img_name)
                 cv2.imwrite(img_path, clean)
 
-                # Auto label frame
-                h, w = clean.shape[:2]
                 results = auto_model.predict(clean, conf=0.10, verbose=False, device='cpu')
                 
                 label_lines = []
@@ -102,11 +109,11 @@ def extract_and_auto_annotate():
 
         cap.release()
 
-    print(f"Extracted and auto-annotated {saved_count} frames.")
+    print(f"Extracted and auto-annotated {saved_count} clean frames.")
     return saved_count, extracted_img_dir, extracted_lbl_dir
 
 def prepare_yolo_dataset(img_dir, lbl_dir):
-    print("Step 2: Splitting dataset into train/val splits...")
+    print("Step 2: Preparing clean train/val dataset splits...")
     
     train_img = os.path.join(DATASET_DIR, "images", "train")
     val_img = os.path.join(DATASET_DIR, "images", "val")
@@ -144,11 +151,11 @@ def prepare_yolo_dataset(img_dir, lbl_dir):
     with open(yaml_path, 'w') as f:
         yaml.dump(yaml_content, f)
 
-    print(f"Dataset prepared: {len(images) - val_size} train images, {val_size} val images.")
+    print(f"Dataset ready: {len(images) - val_size} train images, {val_size} val images.")
     return yaml_path
 
 def run_fine_tuning(yaml_path):
-    print("Step 3: Starting YOLOv8m high-resolution fine-tuning...")
+    print("Step 3: Launching 20-Epoch High-Precision YOLOv8m Fine-Tuning...")
     
     base_weights = os.path.join(BACKEND_DIR, "yolov8m-ppe.pt")
     model = YOLO(base_weights)
@@ -157,21 +164,22 @@ def run_fine_tuning(yaml_path):
     
     results = model.train(
         data=yaml_path,
-        epochs=15,
+        epochs=20,
         imgsz=800,
         batch=4,
+        workers=0,
         hsv_h=0.015,
         hsv_s=0.7,
         hsv_v=0.4,
         degrees=10.0,
         scale=0.5,
         project=project_dir,
-        name="factory_cctv_run",
+        name="factory_clean_run",
         exist_ok=True,
         device="cpu"
     )
 
-    best_weights = os.path.join(project_dir, "factory_cctv_run", "weights", "best.pt")
+    best_weights = os.path.join(project_dir, "factory_clean_run", "weights", "best.pt")
     target_weights = os.path.join(BACKEND_DIR, "yolov8m-ppe.pt")
     
     if os.path.exists(best_weights):
@@ -179,9 +187,7 @@ def run_fine_tuning(yaml_path):
         weights_txt = os.path.join(BACKEND_DIR, "latest_weights.txt")
         with open(weights_txt, 'w') as f:
             f.write(target_weights)
-        print(f"SUCCESS! Trained weights updated at: {target_weights}")
-    else:
-        print("Training completed. Weights saved in runs directory.")
+        print(f"SUCCESS! Fine-tuned weights updated at: {target_weights}")
 
 if __name__ == "__main__":
     count, img_dir, lbl_dir = extract_and_auto_annotate()

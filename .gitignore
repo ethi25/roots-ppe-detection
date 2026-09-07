@@ -24,8 +24,7 @@ backend/uploads/
 backend/processed/
 backend/snapshots/
 backend/extracted_frames/
-backend/dataset/raw_images/
-backend/dataset/raw_labels/
+backend/dataset/
 backend/runs/
 
 # Logs

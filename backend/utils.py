@@ -23,18 +23,18 @@ PPE_CLASSES = {
 
 # Color palette for distinct individual PPE item bounding boxes
 COLOR_PALETTE = {
-    'mask': (255, 255, 0),      # Cyan for Mask
-    'glove': (0, 255, 255),     # Bright Yellow for Gloves
-    'helmet': (255, 191, 0),    # Blue for Helmet
-    'shoes': (255, 0, 255),     # Magenta/Purple for Shoes
-    'goggles': (255, 255, 0),   # Cyan for Goggles/Respirators
-    'no_mask': (0, 0, 255),     # Red for Missing Mask
-    'no_glove': (0, 0, 255),    # Red for Missing Gloves
-    'no_helmet': (0, 0, 255),   # Red for Missing Helmet
-    'no_shoes': (0, 0, 255),    # Red for Missing Shoes
+    'mask': (255, 255, 0),      # Cyan for Present Mask
+    'glove': (0, 255, 255),     # Bright Yellow for Present Glove
+    'helmet': (255, 191, 0),    # Blue for Present Helmet
+    'shoes': (255, 0, 255),     # Magenta for Present Shoes
+    'goggles': (255, 255, 0),   # Cyan for Respirator/Goggles
+    'no_mask': (0, 0, 255),     # Bright Red for Bare Face / Missing Mask
+    'no_glove': (0, 0, 255),    # Bright Red for Bare Hand / Missing Glove
+    'no_helmet': (0, 0, 255),   # Bright Red for Missing Helmet
+    'no_shoes': (0, 0, 255),    # Bright Red for Missing Shoes
 }
 
-def denoise_frame(frame, denoise_h=10, clahe_clip=2.5):
+def denoise_frame(frame, denoise_h=0, clahe_clip=2.5):
     """
     Apply CLAHE in LAB color space to equalize lamp glare and sharpen hand/glove edges.
     """
@@ -56,14 +56,12 @@ def draw_label(img, text, pt, bg_color, text_color=(255, 255, 255), scale=0.5, t
     cv2.rectangle(img, (x, y - th - 6), (x + tw + 6, y + baseline), bg_color, -1)
     cv2.putText(img, text, (x + 3, y - 3), cv2.FONT_HERSHEY_SIMPLEX, scale, text_color, thickness, cv2.LINE_AA)
 
-def extract_frames_smart(video_path, output_dir, diff_threshold=0.2, min_gap_seconds=2, denoise_h=10, clahe_clip=2.5, status_callback=None):
+def extract_frames_smart(video_path, output_dir, diff_threshold=0.2, min_gap_seconds=2, denoise_h=0, clahe_clip=2.5, status_callback=None):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise FileNotFoundError(f"Could not open video file: {video_path}")
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps <= 0:
-        fps = 25.0
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     min_gap_frames = int(fps * min_gap_seconds)
     os.makedirs(output_dir, exist_ok=True)
@@ -105,7 +103,7 @@ def extract_frames_smart(video_path, output_dir, diff_threshold=0.2, min_gap_sec
     cap.release()
     return saved
 
-def overlaps(box_ppe, box_person, threshold=0.10):
+def overlaps(box_ppe, box_person, threshold=0.08):
     x1_p, y1_p, x2_p, y2_p = box_person
     x1_e, y1_e, x2_e, y2_e = box_ppe
     
@@ -135,7 +133,7 @@ def check_compliance(person_box, ppe_detections, strict_mode=False):
         if not label:
             continue
             
-        if overlaps(box_ppe, person_box, threshold=0.10) > 0.10:
+        if overlaps(box_ppe, person_box, threshold=0.08) > 0.08:
             if label == 'helmet':
                 states['helmet'] = 'present'
             elif label == 'no_helmet':
@@ -155,6 +153,7 @@ def check_compliance(person_box, ppe_detections, strict_mode=False):
 
     missing_items = []
     
+    # Flag missing if explicitly detected as absent or missing
     if states['helmet'] == 'absent':
         missing_items.append('Helmet')
     if states['mask'] == 'absent':
@@ -168,8 +167,8 @@ def check_compliance(person_box, ppe_detections, strict_mode=False):
 
 def generate_mjpeg_feed(video_path, ppe_model_path, strict_mode=False):
     """
-    Generates live MJPEG stream with glare-reduction CLAHE, accurate glove/mask compliance checking,
-    and distinct non-overlapping label cards.
+    Generates live MJPEG stream with separate person tracking, CLAHE glare reduction,
+    and individual per-hand glove, mask, and shoe bounding boxes.
     """
     person_model = YOLO("yolo11n.pt")
     
@@ -192,7 +191,7 @@ def generate_mjpeg_feed(video_path, ppe_model_path, strict_mode=False):
                 break
                 
         try:
-            # Equalize glare on factory video frames
+            # Glare equalization for factory lighting
             frame = denoise_frame(frame, denoise_h=0, clahe_clip=2.0)
             
             h, w = frame.shape[:2]
@@ -201,8 +200,9 @@ def generate_mjpeg_feed(video_path, ppe_model_path, strict_mode=False):
                 target_h = int(h * (target_w / float(w)))
                 frame = cv2.resize(frame, (target_w, target_h))
 
-            person_results = person_model.predict(frame, conf=0.25, classes=[0], verbose=False, device='cpu')
-            ppe_results = ppe_model.predict(frame, conf=0.12, verbose=False, device='cpu')
+            # Multi-person tracking and PPE item detection
+            person_results = person_model.track(frame, persist=True, classes=[0], verbose=False, device='cpu')
+            ppe_results = ppe_model.predict(frame, conf=0.10, verbose=False, device='cpu')
             
             ppe_detections = []
             if ppe_results and len(ppe_results) > 0:
@@ -216,14 +216,16 @@ def generate_mjpeg_feed(video_path, ppe_model_path, strict_mode=False):
                     is_violation = 'no_' in label
                     color = (0, 0, 255) if is_violation else COLOR_PALETTE.get(label, (0, 255, 0))
                     
-                    # ONLY draw shoe box when explicitly detected by YOLO
-                    if label in ['shoes', 'no_shoes'] or label in ['glove', 'no_glove', 'mask', 'no_mask', 'helmet', 'no_helmet', 'goggles']:
-                        cv2.rectangle(frame, (int(xyxy[0]), int(xyxy[1])), (int(xyxy[2]), int(xyxy[3])), color, 2)
-                        draw_label(frame, f"{label.upper()} ({conf:.2f})", (int(xyxy[0]), int(xyxy[1])), color)
+                    # Draw SEPARATE individual bounding box around detected item (gloves, mask, shoes, etc.)
+                    cv2.rectangle(frame, (int(xyxy[0]), int(xyxy[1])), (int(xyxy[2]), int(xyxy[3])), color, 2)
+                    draw_label(frame, f"{label.upper()} ({conf:.2f})", (int(xyxy[0]), int(xyxy[1])), color)
 
             if person_results and len(person_results) > 0:
-                for idx, box in enumerate(person_results[0].boxes):
-                    box_person = box.xyxy[0].tolist()
+                boxes = person_results[0].boxes
+                track_ids = boxes.id.int().tolist() if boxes.id is not None else list(range(1, len(boxes) + 1))
+                xyxy_list = boxes.xyxy.tolist()
+                
+                for idx, (track_id, box_person) in enumerate(zip(track_ids, xyxy_list)):
                     px1, py1, px2, py2 = map(int, box_person)
                     
                     missing, states = check_compliance(box_person, ppe_detections, strict_mode=strict_mode)
@@ -232,16 +234,16 @@ def generate_mjpeg_feed(video_path, ppe_model_path, strict_mode=False):
                     box_color = (0, 220, 0) if is_compliant else (0, 0, 255)
                     bg_color = (0, 140, 0) if is_compliant else (0, 0, 180)
                     
+                    # Person overall bounding box (Red if missing gear, Green if compliant)
                     cv2.rectangle(frame, (px1, py1), (px2, py2), box_color, 2)
                     
                     detected_gear = [k.capitalize() for k, v in states.items() if v == 'present']
                     if is_compliant:
                         gear_str = ", ".join(detected_gear) if detected_gear else "OK"
-                        status_text = f"Worker #{idx+1}: COMPLIANT ({gear_str})"
+                        status_text = f"Worker #{track_id}: COMPLIANT ({gear_str})"
                     else:
-                        status_text = f"Worker #{idx+1}: MISSING {', '.join(missing)}"
+                        status_text = f"Worker #{track_id}: MISSING {', '.join(missing)}"
                         
-                    # Stagger y position based on worker index to prevent label collisions when workers stand close together
                     label_y = py1 - (idx % 3) * 22
                     draw_label(frame, status_text, (px1, label_y), bg_color)
 
@@ -273,9 +275,7 @@ def process_video_pipeline(video_path, output_path, ppe_model_path, snapshots_di
         
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps <= 0:
-        fps = 25.0
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
     writer = imageio.get_writer(output_path, fps=fps, codec='libx264', pixelformat='yuv420p', ffmpeg_params=['-movflags', '+faststart'])
@@ -304,7 +304,7 @@ def process_video_pipeline(video_path, output_path, ppe_model_path, snapshots_di
         frame = denoise_frame(frame, denoise_h=0, clahe_clip=2.0)
         
         person_results = person_model.track(frame, persist=True, classes=[0], verbose=False, device='cpu')
-        ppe_results = ppe_model.predict(frame, conf=0.12, verbose=False, device='cpu')
+        ppe_results = ppe_model.predict(frame, conf=0.10, verbose=False, device='cpu')
         
         ppe_detections = []
         if ppe_results and len(ppe_results) > 0:
@@ -329,12 +329,12 @@ def process_video_pipeline(video_path, output_path, ppe_model_path, snapshots_di
                 missing, states = check_compliance(box_person, ppe_detections, strict_mode=strict_mode)
                 
                 if track_id not in violation_counters:
-                    violation_counters[track_id] = {'Helmet': 0, 'Mask': 0, 'Shoes': 0}
+                    violation_counters[track_id] = {'Helmet': 0, 'Mask': 0, 'Shoes': 0, 'Gloves': 0}
                     active_violations[track_id] = set()
                     
                 current_missing = set(missing)
                 
-                for item in ['Helmet', 'Mask', 'Shoes']:
+                for item in ['Helmet', 'Mask', 'Shoes', 'Gloves']:
                     if item in current_missing:
                         violation_counters[track_id][item] += 1
                     else:
@@ -351,28 +351,11 @@ def process_video_pipeline(video_path, output_path, ppe_model_path, snapshots_di
                 if new_violations:
                     timestamp_str = datetime.now().isoformat()
                     video_name = os.path.basename(video_path)
-                    
-                    px1, py1, px2, py2 = map(int, box_person)
-                    margin = 20
-                    px1 = max(0, px1 - margin)
-                    py1 = max(0, py1 - margin)
-                    px2 = min(width, px2 + margin)
-                    py2 = min(height, py2 + margin)
-                    
-                    cropped = frame[py1:py2, px1:px2]
-                    snapshot_filename = f"violation_track{track_id}_frame{frame_num}_{int(time.time())}.jpg"
-                    snapshot_path = os.path.join(snapshots_dir, snapshot_filename)
-                    if cropped.size > 0:
-                        cv2.imwrite(snapshot_path, cropped)
-                    else:
-                        cv2.imwrite(snapshot_path, frame)
-                        
-                    relative_snapshot_path = f"/static/snapshots/{snapshot_filename}"
                     video_time_sec = round(frame_num / float(fps), 2)
                     
                     with open(csv_log_path, 'a', newline='') as f:
                         w = csv.writer(f)
-                        w.writerow([timestamp_str, video_name, frame_num, video_time_sec, track_id, ",".join(new_violations), relative_snapshot_path])
+                        w.writerow([timestamp_str, video_name, frame_num, video_time_sec, track_id, ",".join(new_violations), ""])
                         
                     violations_history.append({
                         "timestamp": timestamp_str,
@@ -381,7 +364,7 @@ def process_video_pipeline(video_path, output_path, ppe_model_path, snapshots_di
                         "video_time_seconds": video_time_sec,
                         "track_id": track_id,
                         "violation_items": new_violations,
-                        "snapshot_path": relative_snapshot_path
+                        "snapshot_path": ""
                     })
                 
                 is_compliant = len(active_violations[track_id]) == 0
