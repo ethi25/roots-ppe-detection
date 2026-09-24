@@ -41,15 +41,16 @@ PPE_CLASSES = {
 }
 
 COLOR_PALETTE = {
-    'mask': (255, 255, 0),      # Cyan
-    'glove': (0, 255, 255),     # Yellow
-    'helmet': (255, 191, 0),    # Blue
-    'shoes': (255, 0, 255),     # Magenta
-    'goggles': (255, 255, 0),   # Cyan
-    'no_mask': (0, 0, 255),     # Red
-    'no_glove': (0, 0, 255),    # Red
-    'no_helmet': (0, 0, 255),   # Red
-    'no_shoes': (0, 0, 255),    # Red
+    'mask': (255, 255, 0),        # Cyan for Present Mask / Respirator
+    'respirator': (255, 255, 0),  # Cyan
+    'glove': (0, 255, 255),       # Bright Yellow for Gloves
+    'helmet': (255, 191, 0),      # Blue for Helmet
+    'shoes': (255, 0, 255),       # Magenta for Safety Shoes
+    'goggles': (255, 255, 0),     # Cyan
+    'no_mask': (0, 0, 255),       # Red for Bare Face
+    'no_glove': (0, 0, 255),      # Red for Bare Hand
+    'no_helmet': (0, 0, 255),     # Red
+    'no_shoes': (0, 0, 255),      # Red
 }
 
 WORKER_HISTORY = {}
@@ -62,30 +63,71 @@ def denoise_frame(frame, clahe_clip=1.5):
     enhanced = cv2.merge((l, a, b))
     return cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
 
-def detect_pink_respirator(head_crop):
+def detect_industrial_respirator(head_crop):
     """
-    Detects industrial 3M 2091/2097 magenta-pink dual-cartridge respirators.
-    Only matches pure magenta/purple-pink (H: 142-168) strictly to prevent false positives on skin/walls.
+    INDUSTRY-READY UNIVERSAL RESPIRATOR DETECTOR:
+    Detects factory half-face and full-face elastomeric respirators (3M 6000, 6200, 7500 series):
+    1. Yellow/Gold Organic Vapor cartridges (3M 6001/6003)
+    2. Pink/Magenta P100 Particulate cartridges (3M 2091/2097)
+    Returns: (has_respirator, bounding_box, label_name)
     """
     if head_crop is None or head_crop.size == 0:
-        return False, None
-    h, w = head_crop.shape[:2]
-    # Check lower half of face crop (where respirator is worn, between nose and chin)
-    lower_face = head_crop[int(h * 0.35):, :]
-    if lower_face.size == 0:
-        return False, None
+        return False, None, ""
+        
+    hh, hw = head_crop.shape[:2]
+    # Check lower 70% of head crop (nose bridge down to below chin)
+    y_start = int(hh * 0.25)
+    y_end = int(hh * 0.95)
+    x_start = int(hw * 0.05)
+    x_end = int(hw * 0.95)
+    
+    face_lower = head_crop[y_start:y_end, x_start:x_end]
+    if face_lower.size == 0:
+        return False, None, ""
+        
+    hsv = cv2.cvtColor(face_lower, cv2.COLOR_BGR2HSV)
+    
+    # Yellow/Gold cartridges (3M 6001/6003 organic vapor)
+    yellow_mask = cv2.inRange(hsv, np.array([16, 50, 70]), np.array([36, 255, 255]))
+    contours_y, _ = cv2.findContours(yellow_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    y_boxes = [cv2.boundingRect(cnt) for cnt in contours_y if cv2.contourArea(cnt) > 70]
+    
+    if y_boxes:
+        min_x = min(b[0] for b in y_boxes)
+        min_y = min(b[1] for b in y_boxes)
+        max_x = max(b[0] + b[2] for b in y_boxes)
+        max_y = max(b[1] + b[3] for b in y_boxes)
+        pad_x = max(8, int((max_x - min_x) * 0.15))
+        pad_y = max(8, int((max_y - min_y) * 0.15))
+        box = [
+            x_start + max(0, min_x - pad_x),
+            y_start + max(0, min_y - pad_y),
+            x_start + min(hw, max_x + pad_x),
+            y_start + min(hh, max_y + pad_y)
+        ]
+        return True, box, "respirator"
 
-    hsv = cv2.cvtColor(lower_face, cv2.COLOR_BGR2HSV)
-    # Strictly magenta-pink (H: 142-168, S: 80-255, V: 70-255)
-    pink_mask = cv2.inRange(hsv, np.array([142, 80, 70]), np.array([168, 255, 255]))
-    contours, _ = cv2.findContours(pink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area > 250: # Real filter cartridge size
-            x, y, cw, ch = cv2.boundingRect(cnt)
-            # Map back to head crop coords
-            return True, [x, y + int(h * 0.35), x + cw, y + int(h * 0.35) + ch]
-    return False, None
+    # Pink/Magenta cartridges (3M 2091/2097 P100)
+    pink_mask = cv2.inRange(hsv, np.array([138, 50, 50]), np.array([170, 255, 255]))
+    contours_p, _ = cv2.findContours(pink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    p_boxes = [cv2.boundingRect(cnt) for cnt in contours_p if cv2.contourArea(cnt) > 90]
+    
+    if p_boxes:
+        min_x = min(b[0] for b in p_boxes)
+        min_y = min(b[1] for b in p_boxes)
+        max_x = max(b[0] + b[2] for b in p_boxes)
+        max_y = max(b[1] + b[3] for b in p_boxes)
+        pad_x = max(8, int((max_x - min_x) * 0.15))
+        pad_y = max(8, int((max_y - min_y) * 0.15))
+        box = [
+            x_start + max(0, min_x - pad_x),
+            y_start + max(0, min_y - pad_y),
+            x_start + min(hw, max_x + pad_x),
+            y_start + min(hh, max_y + pad_y)
+        ]
+        return True, box, "respirator"
+
+    return False, None, ""
 
 def overlaps(box1, box2, threshold=0.10):
     x1_1, y1_1, x2_1, y2_1 = box1
@@ -162,9 +204,9 @@ def draw_label(img, text, pt, bg_color, text_color=(255, 255, 255), scale=0.5, t
     cv2.rectangle(img, (x, y - th - 6), (x + tw + 6, y + baseline), bg_color, -1)
     cv2.putText(img, text, (x + 3, y - 3), cv2.FONT_HERSHEY_SIMPLEX, scale, text_color, thickness, cv2.LINE_AA)
 
-def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_threshold=0.35, is_factory=False):
+def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_threshold=0.30):
     print(f"\n{BOLD}{CYAN}========================================================================{RESET}")
-    print(f"{BOLD}{WHITE}   ROOTS INDUSTRIAL PPE COMPLIANCE DETECTOR - TERMINAL ENGINE{RESET}")
+    print(f"{BOLD}{WHITE}   ROOTS INDUSTRIAL PPE COMPLIANCE DETECTOR - INDUSTRY ENGINE{RESET}")
     print(f"{BOLD}{CYAN}========================================================================{RESET}")
 
     # Load Model Weights
@@ -172,7 +214,7 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
     if not os.path.exists(weights_path):
         weights_path = os.path.join(BACKEND_DIR, "yolov8n-ppe.pt")
     
-    print(f"[*] Loading PPE Model: {YELLOW}{os.path.basename(weights_path)}{RESET}")
+    print(f"[*] Loading Industrial PPE Model: {YELLOW}{os.path.basename(weights_path)}{RESET}")
     ppe_model = YOLO(weights_path)
     
     print(f"[*] Loading Person Tracker: {YELLOW}yolo11n.pt{RESET}")
@@ -184,7 +226,6 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
         print(f"{RED}[ERROR] Failed to open video source: {video_source}{RESET}")
         return
 
-    # Optimize webcam buffer & resolution for high FPS
     is_live = isinstance(video_source, int) or str(video_source).isdigit()
     if is_live:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -196,8 +237,8 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
     
     src_label = f"Webcam #{video_source}" if is_live else os.path.basename(str(video_source))
     print(f"[*] Source: {CYAN}{src_label}{RESET} | Resolution: {int(cap.get(3))}x{int(cap.get(4))}")
-    print(f"[*] Detection Mode: {YELLOW}{'Factory Dual-Respirator' if is_factory else 'General Mask & PPE (Webcam/Standard)'}{RESET}")
-    print(f"[*] Inspection Mode: {YELLOW}{'Strict (Helmet + Mask + Gloves + Shoes)' if strict_mode else 'Standard (Mask + Gloves)'}{RESET}")
+    print(f"[*] Respirator Support: {GREEN}3M 2091/2097 Pink + 3M 6001/6003 Yellow + N95/Surgical Active{RESET}")
+    print(f"[*] Inspection Mode: {YELLOW}{'Strict (All 4 Items Required)' if strict_mode else 'Standard (Mask/Respirator + Gloves)'}{RESET}")
     print(f"[*] GUI Window: {GREEN if show_gui else GRAY}{'Active (Press Q to quit, P to pause)' if show_gui else 'Headless'}{RESET}")
     print(f"{CYAN}------------------------------------------------------------------------{RESET}\n")
 
@@ -209,8 +250,6 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
     start_time = time.time()
     last_terminal_print = 0
     
-    # Cache previous detections for smooth multi-frame interpolation
-    cached_workers_status = []
     fps_history = deque(maxlen=20)
     prev_time = time.time()
 
@@ -232,10 +271,9 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
                 fps_history.append(instant_fps)
                 smooth_fps = sum(fps_history) / len(fps_history)
 
-                # Process detection on every frame (fast single-pass mode)
                 h, w = frame.shape[:2]
 
-                # 1. Global Person Tracking at 480px for high throughput
+                # 1. Global Person Tracking at 480px (fast, robust tracking)
                 track_results = person_model.track(
                     frame,
                     persist=True,
@@ -246,11 +284,9 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
                     device='cpu'
                 )
 
-                # 2. Global PPE Inference at 480px with robust confidence (conf=0.25)
-                # This prevents beards, shadows, and orange background walls from triggering false masks!
-                ppe_results = ppe_model.predict(frame, conf=0.25, imgsz=480, verbose=False, device='cpu')
-                
+                # 2. Global PPE Inference at 480px
                 global_detections = []
+                ppe_results = ppe_model.predict(frame, conf=0.18, imgsz=480, verbose=False, device='cpu')
                 if ppe_results and len(ppe_results) > 0:
                     for box in ppe_results[0].boxes:
                         cls_id = int(box.cls[0].item())
@@ -280,15 +316,14 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
                         }
                         worker_items = []
 
-                        # Match PPE items that overlap with this worker
+                        # A. Match Global PPE Items
                         for (box_ppe, cls_id, conf) in global_detections:
                             if overlaps(box_ppe, box, threshold=0.10) > 0.10:
                                 label = PPE_CLASSES.get(cls_id, '')
                                 if not label:
                                     continue
-                                worker_items.append((box_ppe, cls_id, conf))
+                                worker_items.append((box_ppe, label, conf))
                                 
-                                # Exact class mapping
                                 if label == 'mask':
                                     gear_states['mask'] = 'present'
                                 elif label == 'no_mask':
@@ -306,21 +341,37 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
                                 elif label == 'no_helmet':
                                     gear_states['helmet'] = 'absent'
 
-                        # Optional Factory Pink Dual-Cartridge Respirator Inspection
-                        if is_factory and gear_states['mask'] != 'present':
-                            hy1 = max(0, py1 - 5)
-                            hy2 = min(h, py1 + int(ph * 0.40))
-                            hx1 = max(0, px1 - 10)
-                            hx2 = min(w, px2 + 10)
-                            head_crop = frame[hy1:hy2, hx1:hx2]
-                            has_pink, pink_rect = detect_pink_respirator(head_crop)
-                            if has_pink and pink_rect:
-                                gear_states['mask'] = 'present'
-                                gx1 = hx1 + pink_rect[0]
-                                gy1 = hy1 + pink_rect[1]
-                                gx2 = hx1 + pink_rect[2]
-                                gy2 = hy1 + pink_rect[3]
-                                worker_items.append(([gx1, gy1, gx2, gy2], 3, 0.95))
+                        # B. High-Precision Head Crop Inspection (Respirator / Mask)
+                        hy1 = max(0, py1 - 5)
+                        hy2 = min(h, py1 + int(ph * 0.45))
+                        hx1 = max(0, px1 - 10)
+                        hx2 = min(w, px2 + 10)
+                        head_crop = frame[hy1:hy2, hx1:hx2]
+
+                        # Check 1: Industrial Dual-Cartridge Respirators (Yellow or Pink cartridges)
+                        has_resp, rbox, rtype = detect_industrial_respirator(head_crop)
+                        if has_resp and rbox:
+                            gear_states['mask'] = 'present'
+                            gx1 = hx1 + rbox[0]
+                            gy1 = hy1 + rbox[1]
+                            gx2 = hx1 + rbox[2]
+                            gy2 = hy1 + rbox[3]
+                            worker_items.append(([gx1, gy1, gx2, gy2], "respirator", 0.96))
+
+                        # Check 2: Zoomed Model Prediction for N95 / Surgical Mask (lightweight imgsz=192, ~15ms)
+                        if gear_states['mask'] != 'present' and head_crop.size > 0:
+                            h_res = ppe_model.predict(head_crop, conf=0.15, imgsz=192, verbose=False, device='cpu')
+                            if h_res and len(h_res) > 0:
+                                for hbox in h_res[0].boxes:
+                                    hcls = int(hbox.cls[0].item())
+                                    hlabel = PPE_CLASSES.get(hcls, '')
+                                    hconf = float(hbox.conf[0].item())
+                                    if hlabel in ['mask', 'goggles']:
+                                        gear_states['mask'] = 'present'
+                                        cx1, cy1, cx2, cy2 = map(int, hbox.xyxy[0].tolist())
+                                        worker_items.append(([hx1 + cx1, hy1 + cy1, hx1 + cx2, hy1 + cy2], "mask", hconf))
+                                    elif hlabel == 'no_mask':
+                                        gear_states['mask'] = 'absent'
 
                         # Determine Missing Items
                         current_missing = []
@@ -360,14 +411,12 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
                             alert_msg = f"{RED}{BOLD}>>> [VIOLATION ALERT]{RESET} Worker #{track_id} Non-Compliant | Missing: {', '.join(smoothed_missing)}"
                             print(alert_msg)
 
-                cached_workers_status = current_workers_status
-
                 # Render GUI preview window
                 if show_gui:
-                    for w_info in cached_workers_status:
+                    for w_info in current_workers_status:
                         px1, py1, px2, py2 = map(int, w_info['box'])
                         is_compliant = w_info['compliant']
-                        box_color = (0, 255, 0) if is_compliant else (0, 0, 255) # Green or Red
+                        box_color = (0, 255, 0) if is_compliant else (0, 0, 255)
                         
                         # Worker Box
                         cv2.rectangle(frame, (px1, py1), (px2, py2), box_color, 2)
@@ -380,17 +429,15 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
                             draw_label(frame, miss_text, (px1, py1 + 22), (0, 0, 255), (255, 255, 255), scale=0.55, thickness=2)
 
                         # Individual item boxes
-                        for (item_box, cls_id, conf) in w_info['items']:
-                            label_name = PPE_CLASSES.get(cls_id, '')
-                            if label_name:
-                                ix1, iy1, ix2, iy2 = map(int, item_box)
-                                item_color = COLOR_PALETTE.get(label_name, (255, 255, 255))
-                                cv2.rectangle(frame, (ix1, iy1), (ix2, iy2), item_color, 2)
-                                text_c = (0, 0, 0) if label_name == 'glove' else (255, 255, 255)
-                                draw_label(frame, f"{label_name} {conf:.2f}", (ix1, iy1 - 4), item_color, text_c, scale=0.45, thickness=1)
+                        for (item_box, label_name, conf) in w_info['items']:
+                            ix1, iy1, ix2, iy2 = map(int, item_box)
+                            item_color = COLOR_PALETTE.get(label_name, (255, 255, 0))
+                            cv2.rectangle(frame, (ix1, iy1), (ix2, iy2), item_color, 2)
+                            text_c = (0, 0, 0) if label_name == 'glove' else (255, 255, 255)
+                            draw_label(frame, f"{label_name.upper()} {conf:.2f}", (ix1, iy1 - 4), item_color, text_c, scale=0.45, thickness=1)
 
                     # Top stats bar on video window
-                    stats_str = f"FPS: {smooth_fps:.1f} | Workers: {len(cached_workers_status)} | Violations: {total_violations_logged}"
+                    stats_str = f"FPS: {smooth_fps:.1f} | Active: {len(current_workers_status)} | Violations Logged: {total_violations_logged}"
                     draw_label(frame, stats_str, (10, 25), (40, 40, 40), (0, 255, 255), scale=0.55, thickness=1)
 
                     cv2.imshow("Roots Industrial PPE Detector (Press Q to Quit, P to Pause)", frame)
@@ -411,10 +458,10 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
 
                     print(f"\n{BOLD}{CYAN}--- [Frame {frame_count:05d}{f'/{total_frames}' if not is_live else ''} | Time: {time_code} | Speed: {smooth_fps:.1f} FPS] ---{RESET}")
                     
-                    if cached_workers_status:
-                        print(f"{BOLD}{'WORKER':<12} | {'RESPIRATOR/MASK':<16} | {'GLOVES':<12} | {'STATUS':<15} | {'NOTES'}{RESET}")
-                        print(f"{GRAY}{'-'*75}{RESET}")
-                        for w_info in cached_workers_status:
+                    if current_workers_status:
+                        print(f"{BOLD}{'WORKER':<12} | {'RESPIRATOR/MASK':<18} | {'GLOVES':<12} | {'STATUS':<15} | {'NOTES'}{RESET}")
+                        print(f"{GRAY}{'-'*78}{RESET}")
+                        for w_info in current_workers_status:
                             wid = f"Worker #{w_info['id']}"
                             g = w_info['gear']
                             
@@ -428,11 +475,11 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
                                 status_txt = f"{RED}{BOLD}VIOLATION{RESET}"
                                 notes_txt = f"{RED}Missing: {', '.join(w_info['missing'])}{RESET}"
                                 
-                            print(f"{wid:<12} | {mask_txt:<25} | {glove_txt:<21} | {status_txt:<24} | {notes_txt}")
+                            print(f"{wid:<12} | {mask_txt:<27} | {glove_txt:<21} | {status_txt:<24} | {notes_txt}")
                     else:
                         print(f"{GRAY}No workers currently active in camera field of view.{RESET}")
 
-                    total_active = len(cached_workers_status)
+                    total_active = len(current_workers_status)
                     compliance_rate = (frame_compliant / total_active * 100) if total_active > 0 else 100.0
                     rate_color = GREEN if compliance_rate >= 80 else (YELLOW if compliance_rate >= 50 else RED)
                     print(f"{BOLD}Summary:{RESET} Active: {total_active} | Compliant: {GREEN}{frame_compliant}{RESET} | Violations: {RED}{frame_violations}{RESET} | Rate: {rate_color}{compliance_rate:.1f}%{RESET} | Logged: {YELLOW}{total_violations_logged}{RESET}")
@@ -467,12 +514,11 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
     print(f"{BOLD}{CYAN}========================================================================{RESET}\n")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Roots Industrial PPE Compliance Detector - Terminal Engine")
+    parser = argparse.ArgumentParser(description="Roots Industrial PPE Compliance Detector - Industry Engine")
     parser.add_argument("--video", "-v", type=str, default=None, help="Path to video file or webcam index (default: interactive prompt)")
     parser.add_argument("--headless", action="store_true", help="Run in pure terminal mode without OpenCV GUI window")
     parser.add_argument("--strict", "-s", action="store_true", help="Require all 4 items including helmet and shoes")
-    parser.add_argument("--conf", "-c", type=float, default=0.35, help="Worker person detection confidence")
-    parser.add_argument("--factory", action="store_true", help="Enable 3M pink dual-cartridge respirator color verification for factory CCTV footage")
+    parser.add_argument("--conf", "-c", type=float, default=0.30, help="Worker person detection confidence")
     args = parser.parse_args()
 
     video_input = args.video
@@ -486,6 +532,5 @@ if __name__ == "__main__":
         video_source=video_input,
         show_gui=not args.headless,
         strict_mode=args.strict,
-        conf_threshold=args.conf,
-        is_factory=args.factory
+        conf_threshold=args.conf
     )

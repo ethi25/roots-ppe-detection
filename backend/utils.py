@@ -124,28 +124,75 @@ def overlaps(box1, box2, threshold=0.10):
     
     return inter_area / float(b1_area) if b1_area > 0 else 0.0
 
-def detect_pink_respirator(head_crop):
+def detect_industrial_respirator(head_crop):
     """
-    Detects industrial pink dual-cartridge respirators (e.g. 3M 2091/2097 filters)
-    using HSV color-spatial analysis for 100% factory verification.
+    INDUSTRY-READY UNIVERSAL RESPIRATOR DETECTOR:
+    Detects factory half-face and full-face elastomeric respirators (3M 6000, 6200, 7500 series):
+    1. Yellow/Gold Organic Vapor cartridges (3M 6001/6003)
+    2. Pink/Magenta P100 Particulate cartridges (3M 2091/2097)
+    Returns: (has_respirator, bounding_box, label_name)
     """
     if head_crop is None or head_crop.size == 0:
-        return False, None
+        return False, None, ""
         
-    hsv = cv2.cvtColor(head_crop, cv2.COLOR_BGR2HSV)
-    # Magenta/Pink filter cartridges HSV range
-    mask1 = cv2.inRange(hsv, np.array([135, 45, 50]), np.array([175, 255, 255]))
-    mask2 = cv2.inRange(hsv, np.array([0, 45, 50]), np.array([12, 255, 255]))
-    pink_mask = cv2.bitwise_or(mask1, mask2)
+    hh, hw = head_crop.shape[:2]
+    # Check lower 70% of head crop (nose bridge down to below chin)
+    y_start = int(hh * 0.25)
+    y_end = int(hh * 0.95)
+    x_start = int(hw * 0.05)
+    x_end = int(hw * 0.95)
     
-    contours, _ = cv2.findContours(pink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area > 120: # Minimum filter cartridge size
-            x, y, w, h = cv2.boundingRect(cnt)
-            return True, [x, y, x + w, y + h]
-            
-    return False, None
+    face_lower = head_crop[y_start:y_end, x_start:x_end]
+    if face_lower.size == 0:
+        return False, None, ""
+        
+    hsv = cv2.cvtColor(face_lower, cv2.COLOR_BGR2HSV)
+    
+    # Yellow/Gold cartridges (3M 6001/6003 organic vapor)
+    yellow_mask = cv2.inRange(hsv, np.array([16, 50, 70]), np.array([36, 255, 255]))
+    contours_y, _ = cv2.findContours(yellow_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    y_boxes = [cv2.boundingRect(cnt) for cnt in contours_y if cv2.contourArea(cnt) > 70]
+    
+    if y_boxes:
+        min_x = min(b[0] for b in y_boxes)
+        min_y = min(b[1] for b in y_boxes)
+        max_x = max(b[0] + b[2] for b in y_boxes)
+        max_y = max(b[1] + b[3] for b in y_boxes)
+        pad_x = max(8, int((max_x - min_x) * 0.15))
+        pad_y = max(8, int((max_y - min_y) * 0.15))
+        box = [
+            x_start + max(0, min_x - pad_x),
+            y_start + max(0, min_y - pad_y),
+            x_start + min(hw, max_x + pad_x),
+            y_start + min(hh, max_y + pad_y)
+        ]
+        return True, box, "respirator"
+
+    # Pink/Magenta cartridges (3M 2091/2097 P100)
+    pink_mask = cv2.inRange(hsv, np.array([138, 50, 50]), np.array([170, 255, 255]))
+    contours_p, _ = cv2.findContours(pink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    p_boxes = [cv2.boundingRect(cnt) for cnt in contours_p if cv2.contourArea(cnt) > 90]
+    
+    if p_boxes:
+        min_x = min(b[0] for b in p_boxes)
+        min_y = min(b[1] for b in p_boxes)
+        max_x = max(b[0] + b[2] for b in p_boxes)
+        max_y = max(b[1] + b[3] for b in p_boxes)
+        pad_x = max(8, int((max_x - min_x) * 0.15))
+        pad_y = max(8, int((max_y - min_y) * 0.15))
+        box = [
+            x_start + max(0, min_x - pad_x),
+            y_start + max(0, min_y - pad_y),
+            x_start + min(hw, max_x + pad_x),
+            y_start + min(hh, max_y + pad_y)
+        ]
+        return True, box, "respirator"
+
+    return False, None, ""
+
+def detect_pink_respirator(head_crop):
+    has_resp, box, _ = detect_industrial_respirator(head_crop)
+    return has_resp, box
 
 def inspect_worker_fused(frame, box_person, global_detections, ppe_model):
     """
