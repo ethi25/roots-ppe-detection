@@ -305,20 +305,30 @@ def select_video_interactive():
     existing = [p for p in candidates if os.path.exists(p)]
     
     print(f"\n{BOLD}{CYAN}=== Select Video Source ==={RESET}")
-    print(f"  {BOLD}[3]{RESET} {GREEN}{BOLD}[D3] PC SPRAY BOOTH WEST WALL{RESET} (Live 192.168.127.5 Ch 302)")
-    print(f"  {BOLD}[D]{RESET} {GREEN}{BOLD}[D29] POWDER COATING OFFICE AREA{RESET} (Live 192.168.127.5 Ch 2902)")
-    print(f"  {BOLD}[0]{RESET} {CYAN}Live Webcam #0 (USB / Built-in Camera){RESET}")
-    print(f"  {BOLD}[R]{RESET} {MAGENTA}Live External CCTV Server / IP Camera (Enter IP or RTSP){RESET}")
+    print(f"  {BOLD}[23]{RESET} {GREEN}{BOLD}[D23] TOOL ROOM{RESET} (Live 192.168.127.5 Ch 2302)")
+    print(f"  {BOLD}[3]{RESET}  {GREEN}{BOLD}[D3]  PC SPRAY BOOTH WEST WALL{RESET} (Live 192.168.127.5 Ch 302)")
+    print(f"  {BOLD}[29]{RESET} {GREEN}{BOLD}[D29] POWDER COATING OFFICE AREA{RESET} (Live 192.168.127.5 Ch 2902)")
+    print(f"  {BOLD}[0]{RESET}  {CYAN}Live Webcam #0 (USB / Built-in Camera){RESET}")
+    print(f"  {BOLD}[R]{RESET}  {MAGENTA}Live External CCTV Server / IP Camera (Enter IP or RTSP){RESET}")
     for idx, path in enumerate(existing):
         sz = os.path.getsize(path) / (1024 * 1024)
         tag = f"{GREEN}[FINE-TUNED]{RESET}" if "CCTV 3" in path else ""
         print(f"  {BOLD}[{idx + 1}]{RESET} {path} ({sz:.1f} MB) {tag}")
     print(f"  {BOLD}[{len(existing) + 1}]{RESET} Enter custom video file path")
     
-    choice = input(f"\nEnter choice [3, D, 0, R, or 1-{len(existing)+1}] (default: 3): ").strip() or "3"
+    choice = input(f"\nEnter choice [23, 3, 29, 0, R, or 1-{len(existing)+1}] (default: 23): ").strip() or "23"
     
     try:
-        if choice.upper() in ["3", "D3"]:
+        if choice.upper() in ["23", "D23"]:
+            return resolve_cctv_source(
+                "192.168.127.5",
+                user="admin",
+                password="dmin@123",
+                brand="hikvision",
+                channel=23,
+                area="TOOL ROOM"
+            )
+        elif choice.upper() in ["3", "D3"]:
             return resolve_cctv_source(
                 "192.168.127.5",
                 user="admin",
