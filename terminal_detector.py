@@ -162,22 +162,32 @@ def select_video_interactive():
     
     print(f"\n{BOLD}{CYAN}=== Select Video Source ==={RESET}")
     print(f"  {BOLD}[0]{RESET} {GREEN}Live Webcam #0 (USB / Built-in Camera){RESET}")
+    print(f"  {BOLD}[R]{RESET} {MAGENTA}Live External CCTV Server / IP Camera (RTSP / HTTP stream){RESET}")
     for idx, path in enumerate(existing):
         sz = os.path.getsize(path) / (1024 * 1024)
         tag = f"{GREEN}[FINE-TUNED]{RESET}" if "CCTV 3" in path else ""
         print(f"  {BOLD}[{idx + 1}]{RESET} {path} ({sz:.1f} MB) {tag}")
     print(f"  {BOLD}[{len(existing) + 1}]{RESET} Enter custom video file path")
     
-    choice = input(f"\nEnter choice [0-{len(existing)+1}] (default: 0 for Webcam): ").strip() or "0"
+    choice = input(f"\nEnter choice [0-{len(existing)+1} or R]: ").strip() or "0"
     
     try:
-        if choice == "0":
+        if choice.upper() == "R":
+            print(f"\n{YELLOW}Examples of CCTV RTSP URLs:{RESET}")
+            print("  * Hikvision: rtsp://admin:password@192.168.1.64:554/Streaming/Channels/102")
+            print("  * Dahua:     rtsp://admin:password@192.168.1.108:554/cam/realmonitor?channel=1&subtype=1")
+            print("  * CP Plus:   rtsp://admin:password@192.168.1.250:554/cam/realmonitor?channel=1&subtype=1")
+            print("  * Uniview:   rtsp://admin:password@192.168.1.13:554/unicast/c1/s1/live")
+            print("  * Axis:      rtsp://root:password@192.168.1.10/axis-media/media.amp")
+            url = input("\nEnter CCTV RTSP / Stream URL: ").strip().strip('"').strip("'")
+            return url
+        elif choice == "0":
             return 0
         choice_idx = int(choice) - 1
         if 0 <= choice_idx < len(existing):
             return existing[choice_idx]
         else:
-            custom_path = input("Enter full path to video file: ").strip().strip('"').strip("'")
+            custom_path = input("Enter full path to video file or stream URL: ").strip().strip('"').strip("'")
             return custom_path
     except Exception:
         return 0
@@ -206,22 +216,39 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
     print(f"[*] Loading Person Tracker: {YELLOW}yolo11n.pt{RESET} + {GREEN}ByteTrack ({tracker}){RESET}")
     person_model = YOLO("yolo11n.pt")
 
+    video_str = str(video_source).strip()
+    is_rtsp = video_str.startswith("rtsp://")
+    is_http_stream = video_str.startswith(("http://", "https://"))
+    is_webcam = isinstance(video_source, int) or video_str.isdigit()
+    is_live = is_webcam or is_rtsp or is_http_stream
+
+    if is_rtsp:
+        # Enforce TCP transport for RTSP to prevent packet drop and frame corruption in factory networks
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+        print(f"[*] RTSP Transport: {GREEN}Enforcing TCP mode (low packet loss){RESET}")
+
     # Open Video Source
-    cap = cv2.VideoCapture(video_source)
+    cap = cv2.VideoCapture(video_source if not is_webcam else int(video_source))
     if not cap.isOpened():
         print(f"{RED}[ERROR] Failed to open video source: {video_source}{RESET}")
         return
 
-    is_live = isinstance(video_source, int) or str(video_source).isdigit()
     if is_live:
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) # Prevent buffer bloat / stream latency lag
+        if is_webcam:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_live else 0
     
-    src_label = f"Webcam #{video_source}" if is_live else os.path.basename(str(video_source))
+    if is_rtsp or is_http_stream:
+        src_label = f"Live CCTV Stream ({video_str[:35]}...)" if len(video_str) > 35 else f"Live CCTV Stream ({video_str})"
+    elif is_webcam:
+        src_label = f"Webcam #{video_source}"
+    else:
+        src_label = os.path.basename(video_str)
+
     print(f"[*] Source: {CYAN}{src_label}{RESET} | Resolution: {int(cap.get(3))}x{int(cap.get(4))}")
     print(f"[*] Multi-Object Tracker: {GREEN}ByteTrack ({tracker}){RESET}")
     print(f"[*] Respirator Support: {GREEN}3M 2091/2097 Pink + 3M 6001/6003 Yellow + N95/Surgical Active{RESET}")
@@ -263,6 +290,15 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
                     if not is_live and frame_count >= total_frames - 5:
                         print(f"\n{GREEN}[*] Reached end of video file.{RESET}")
                         break
+                    elif is_live:
+                        # Auto-reconnection for live CCTV/RTSP streams on network drops
+                        print(f"\n{YELLOW}[!] Stream frame dropped or network interrupted. Attempting auto-reconnect...{RESET}")
+                        time.sleep(1.0)
+                        cap.release()
+                        cap = cv2.VideoCapture(video_source if not is_webcam else int(video_source))
+                        if is_live:
+                            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                        continue
                     time.sleep(0.01)
                     continue
 
