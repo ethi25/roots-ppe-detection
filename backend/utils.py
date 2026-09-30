@@ -148,36 +148,22 @@ def detect_industrial_respirator(head_crop):
         
     hsv = cv2.cvtColor(face_lower, cv2.COLOR_BGR2HSV)
     
-    # Yellow/Gold cartridges (3M 6001/6003 organic vapor)
-    yellow_mask = cv2.inRange(hsv, np.array([16, 50, 70]), np.array([36, 255, 255]))
+    # 1. Industrial Yellow (Hue 25-36, Saturation >= 130 to reject all human skin tones)
+    yellow_mask = cv2.inRange(hsv, np.array([25, 130, 100]), np.array([36, 255, 255]))
     contours_y, _ = cv2.findContours(yellow_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    y_boxes = [cv2.boundingRect(cnt) for cnt in contours_y if cv2.contourArea(cnt) > 70]
+    y_boxes = [cv2.boundingRect(cnt) for cnt in contours_y if cv2.contourArea(cnt) > 150]
     
-    if y_boxes:
-        min_x = min(b[0] for b in y_boxes)
-        min_y = min(b[1] for b in y_boxes)
-        max_x = max(b[0] + b[2] for b in y_boxes)
-        max_y = max(b[1] + b[3] for b in y_boxes)
-        pad_x = max(8, int((max_x - min_x) * 0.15))
-        pad_y = max(8, int((max_y - min_y) * 0.15))
-        box = [
-            x_start + max(0, min_x - pad_x),
-            y_start + max(0, min_y - pad_y),
-            x_start + min(hw, max_x + pad_x),
-            y_start + min(hh, max_y + pad_y)
-        ]
-        return True, box, "respirator"
-
-    # Pink/Magenta cartridges (3M 2091/2097 P100)
-    pink_mask = cv2.inRange(hsv, np.array([138, 50, 50]), np.array([170, 255, 255]))
+    # 2. Industrial Pink/Magenta P100 (Hue 138-172, Saturation >= 85 to reject lips/reflections)
+    pink_mask = cv2.inRange(hsv, np.array([138, 85, 60]), np.array([172, 255, 255]))
     contours_p, _ = cv2.findContours(pink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    p_boxes = [cv2.boundingRect(cnt) for cnt in contours_p if cv2.contourArea(cnt) > 90]
+    p_boxes = [cv2.boundingRect(cnt) for cnt in contours_p if cv2.contourArea(cnt) > 120]
     
-    if p_boxes:
-        min_x = min(b[0] for b in p_boxes)
-        min_y = min(b[1] for b in p_boxes)
-        max_x = max(b[0] + b[2] for b in p_boxes)
-        max_y = max(b[1] + b[3] for b in p_boxes)
+    chosen_boxes = p_boxes if p_boxes else y_boxes
+    if chosen_boxes:
+        min_x = min(b[0] for b in chosen_boxes)
+        min_y = min(b[1] for b in chosen_boxes)
+        max_x = max(b[0] + b[2] for b in chosen_boxes)
+        max_y = max(b[1] + b[3] for b in chosen_boxes)
         pad_x = max(8, int((max_x - min_x) * 0.15))
         pad_y = max(8, int((max_y - min_y) * 0.15))
         box = [
@@ -222,7 +208,7 @@ def inspect_worker_fused(frame, box_person, global_detections, ppe_model):
                 
             worker_item_boxes.append((box_ppe, cls_id, conf))
             
-            if label in ['mask', 'goggles']:
+            if label == 'mask':
                 gear_states['mask'] = 'present'
             elif label == 'no_mask' and gear_states['mask'] != 'present':
                 gear_states['mask'] = 'absent'
@@ -268,7 +254,7 @@ def inspect_worker_fused(frame, box_person, global_detections, ppe_model):
                 global_box = [hx1 + cx1, hy1 + cy1, hx1 + cx2, hy1 + cy2]
                 worker_item_boxes.append((global_box, cls_id, conf))
                 
-                if label in ['mask', 'goggles']:
+                if label == 'mask':
                     gear_states['mask'] = 'present'
                 elif label == 'no_mask' and gear_states['mask'] != 'present':
                     gear_states['mask'] = 'absent'
@@ -388,8 +374,8 @@ def generate_mjpeg_feed(video_path, ppe_model_path, strict_mode=False):
                     conf = float(box.conf[0].item())
                     global_detections.append((xyxy, cls_id, conf))
 
-            # 2. Multi-Person Tracking
-            person_results = person_model.track(frame, persist=True, classes=[0], verbose=False, device='cpu')
+            # 2. Multi-Person Tracking with ByteTrack
+            person_results = person_model.track(frame, persist=True, classes=[0], tracker="bytetrack.yaml", verbose=False, device='cpu')
             
             if person_results and len(person_results) > 0:
                 boxes = person_results[0].boxes
@@ -505,7 +491,8 @@ def process_video_pipeline(video_path, output_path, ppe_model_path, snapshots_di
                 conf = float(box.conf[0].item())
                 global_detections.append((xyxy, cls_id, conf))
         
-        person_results = person_model.track(frame, persist=True, classes=[0], verbose=False, device='cpu')
+        # Multi-Person Tracking with ByteTrack
+        person_results = person_model.track(frame, persist=True, classes=[0], tracker="bytetrack.yaml", verbose=False, device='cpu')
         
         if person_results and len(person_results) > 0 and person_results[0].boxes.id is not None:
             boxes = person_results[0].boxes

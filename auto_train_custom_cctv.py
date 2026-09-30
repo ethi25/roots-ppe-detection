@@ -90,22 +90,29 @@ def extract_and_auto_annotate(target_frames=50):
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    # Sample across video duration: skip first 15 seconds, jump periodically
-    step_frames = max(int(fps * 5), int(total_frames / (target_frames * 1.5)))
-    print(f"Reading: {os.path.basename(vid_path)} ({total_frames} frames, ~{total_frames/fps/60:.1f} mins) - sampling every ~{step_frames/fps:.1f}s")
+    # Sequential frame sampling without seek-based macroblock corruption
+    step_frames = max(int(fps * 3), int(total_frames / max(1, target_frames * 2)))
+    print(f"Reading: {os.path.basename(vid_path)} ({total_frames} frames, ~{total_frames/fps/60:.1f} mins) - sampling every ~{step_frames/fps:.1f}s cleanly...")
 
-    pos = int(fps * 20)
-    while pos < total_frames and saved_count < target_frames:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
-        # Settle H.265 GOP decoder by reading 15 consecutive frames
-        frame = None
-        for _ in range(15):
-            ret, f = cap.read()
-            if ret:
-                frame = f
+    frame_idx = 0
+    skip_initial = int(fps * 10)
 
-        if frame is None:
-            pos += step_frames
+    while saved_count < target_frames and frame_idx < total_frames:
+        if frame_idx >= skip_initial and (frame_idx % step_frames == 0):
+            ret, frame = cap.read()
+            frame_idx += 1
+            if not ret or frame is None:
+                break
+
+            # Validate that frame is not a corrupted H.264/H.265 grey macroblock smear
+            diff_from_grey = np.abs(frame.astype(float) - 128.0)
+            if np.mean(diff_from_grey < 20) > 0.40:
+                continue
+        else:
+            ret = cap.grab()
+            frame_idx += 1
+            if not ret:
+                break
             continue
 
         clean = denoise_frame(frame, clahe_clip=2.0)
@@ -206,6 +213,29 @@ def prepare_yolo_dataset(img_dir, lbl_dir):
     yaml_path = os.path.join(DATASET_DIR, "ppe_custom.yaml")
     with open(yaml_path, 'w') as f:
         yaml.dump(yaml_content, f)
+
+    # Dataset Class Distribution Audit
+    train_txts = glob.glob(os.path.join(train_lbl, "*.txt"))
+    class_counts = {k: 0 for k in PPE_CLASSES.keys()}
+    for tp in train_txts:
+        with open(tp, 'r') as fp:
+            for line in fp:
+                parts = line.strip().split()
+                if parts:
+                    try:
+                        cid = int(parts[0])
+                        class_counts[cid] = class_counts.get(cid, 0) + 1
+                    except ValueError:
+                        pass
+
+    print("\n" + "="*50)
+    print("      DATASET CLASS DISTRIBUTION AUDIT")
+    print("="*50)
+    for cid, name in PPE_CLASSES.items():
+        cnt = class_counts.get(cid, 0)
+        status = "[OK]" if cnt > 10 else "[CRITICAL WARNING: 0 or low labels - risk of negative bias]"
+        print(f"  Class {cid:2d} ({name:12s}): {cnt:4d} instances {status}")
+    print("="*50 + "\n")
 
     print(f"Clean CCTV 3 Dataset Ready: {len(images) - val_size} train frames, {val_size} val frames.")
     return yaml_path
