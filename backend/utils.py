@@ -375,7 +375,7 @@ def generate_mjpeg_feed(video_path, ppe_model_path, strict_mode=False):
                     global_detections.append((xyxy, cls_id, conf))
 
             # 2. Multi-Person Tracking with ByteTrack
-            person_results = person_model.track(frame, persist=True, classes=[0], tracker="bytetrack.yaml", verbose=False, device='cpu')
+            person_results = person_model.track(frame, persist=True, classes=[0], conf=0.15, imgsz=512, tracker="bytetrack.yaml", verbose=False, device='cpu')
             
             if person_results and len(person_results) > 0:
                 boxes = person_results[0].boxes
@@ -492,11 +492,11 @@ def process_video_pipeline(video_path, output_path, ppe_model_path, snapshots_di
                 global_detections.append((xyxy, cls_id, conf))
         
         # Multi-Person Tracking with ByteTrack
-        person_results = person_model.track(frame, persist=True, classes=[0], tracker="bytetrack.yaml", verbose=False, device='cpu')
+        person_results = person_model.track(frame, persist=True, classes=[0], conf=0.15, imgsz=512, tracker="bytetrack.yaml", verbose=False, device='cpu')
         
-        if person_results and len(person_results) > 0 and person_results[0].boxes.id is not None:
+        if person_results and len(person_results) > 0 and len(person_results[0].boxes) > 0:
             boxes = person_results[0].boxes
-            track_ids = boxes.id.int().tolist()
+            track_ids = boxes.id.int().tolist() if boxes.id is not None else list(range(1, len(boxes) + 1))
             xyxy_list = boxes.xyxy.tolist()
             
             for idx, (track_id, box_person) in enumerate(zip(track_ids, xyxy_list)):

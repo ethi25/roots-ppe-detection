@@ -190,7 +190,7 @@ def draw_label(img, text, pt, bg_color, text_color=(255, 255, 255), scale=0.5, t
     cv2.rectangle(img, (x, y - th - 6), (x + tw + 6, y + baseline), bg_color, -1)
     cv2.putText(img, text, (x + 3, y - 3), cv2.FONT_HERSHEY_SIMPLEX, scale, text_color, thickness, cv2.LINE_AA)
 
-def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_threshold=0.30, tracker="bytetrack.yaml"):
+def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_threshold=0.18, tracker="bytetrack.yaml", stride=None):
     print(f"\n{BOLD}{CYAN}========================================================================{RESET}")
     print(f"{BOLD}{WHITE}   ROOTS INDUSTRIAL PPE COMPLIANCE DETECTOR - INDUSTRY ENGINE{RESET}")
     print(f"{BOLD}{CYAN}========================================================================{RESET}")
@@ -229,6 +229,14 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
     print(f"[*] GUI Window: {GREEN if show_gui else GRAY}{'Active (Press Q to quit, P to pause)' if show_gui else 'Headless'}{RESET}")
     print(f"{CYAN}------------------------------------------------------------------------{RESET}\n")
 
+    if stride is None:
+        stride = 1 if is_live else 2
+
+    # Warm up models on CPU to eliminate initial inference lag
+    dummy = np.zeros((576, 1024, 3), dtype=np.uint8)
+    person_model.track(dummy, persist=True, classes=[0], imgsz=512, tracker=tracker, verbose=False, device='cpu')
+    ppe_model.predict(dummy, conf=0.14, imgsz=512, verbose=False, device='cpu')
+
     frame_count = 0
     total_workers_seen = set()
     total_violations_logged = 0
@@ -239,11 +247,18 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
     
     fps_history = deque(maxlen=20)
     prev_time = time.time()
+    WORKER_GEAR_CACHE = {}
+    last_global_detections = []
+
+    WIN_TITLE = "Roots Industrial PPE Detector (Press Q to Quit, P to Pause)"
+    if show_gui:
+        cv2.namedWindow(WIN_TITLE, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(WIN_TITLE, 1280, 720)
 
     try:
         while True:
             if not paused:
-                ret, frame = cap.read()
+                ret, raw_frame = cap.read()
                 if not ret:
                     if not is_live and frame_count >= total_frames - 5:
                         print(f"\n{GREEN}[*] Reached end of video file.{RESET}")
@@ -251,156 +266,185 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
                     time.sleep(0.01)
                     continue
 
-                frame_count += 1
+                if not is_live and stride > 1:
+                    for _ in range(stride - 1):
+                        cap.grab()
+
+                frame_count += stride
                 curr_t = time.time()
                 instant_fps = 1.0 / max(0.001, (curr_t - prev_time))
                 prev_time = curr_t
                 fps_history.append(instant_fps)
                 smooth_fps = sum(fps_history) / len(fps_history)
 
+                # Normalize frame resolution to 1024 width so display fits monitor and CPU inference is fast
+                orig_h, orig_w = raw_frame.shape[:2]
+                target_w = 1024 if orig_w > 1024 else orig_w
+                scale_w = target_w / float(orig_w)
+                target_h = int(orig_h * scale_w)
+                if scale_w < 1.0:
+                    frame = cv2.resize(raw_frame, (target_w, target_h))
+                else:
+                    frame = raw_frame
+
                 h, w = frame.shape[:2]
 
-                # 1. Global Person Multi-Object Tracking with ByteTrack at 480px
+                # 1. Global Multi-Person Tracking with ByteTrack at 512px
                 track_results = person_model.track(
                     frame,
                     persist=True,
                     classes=[0],
                     conf=conf_threshold,
-                    imgsz=480,
+                    imgsz=512,
                     tracker=tracker,
                     verbose=False,
                     device='cpu'
                 )
 
-                # 2. Global PPE Inference at 480px
-                global_detections = []
-                ppe_results = ppe_model.predict(frame, conf=0.18, imgsz=480, verbose=False, device='cpu')
-                if ppe_results and len(ppe_results) > 0:
-                    for box in ppe_results[0].boxes:
-                        cls_id = int(box.cls[0].item())
-                        conf = float(box.conf[0].item())
-                        xyxy = list(map(int, box.xyxy[0].tolist()))
-                        global_detections.append((xyxy, cls_id, conf))
+                # 2. Global PPE Inference at 512px (cached every 2 frames to save CPU)
+                if frame_count % 2 == 0 or len(last_global_detections) == 0:
+                    ppe_results = ppe_model.predict(frame, conf=0.14, imgsz=512, verbose=False, device='cpu')
+                    last_global_detections = []
+                    if ppe_results and len(ppe_results) > 0:
+                        for box in ppe_results[0].boxes:
+                            cls_id = int(box.cls[0].item())
+                            conf = float(box.conf[0].item())
+                            xyxy = list(map(int, box.xyxy[0].tolist()))
+                            last_global_detections.append((xyxy, cls_id, conf))
+                global_detections = last_global_detections
 
                 current_workers_status = []
                 frame_violations = 0
                 frame_compliant = 0
 
-                if track_results and track_results[0].boxes and track_results[0].boxes.id is not None:
+                if track_results and track_results[0].boxes and len(track_results[0].boxes) > 0:
                     boxes = track_results[0].boxes.xyxy.cpu().numpy()
-                    track_ids = track_results[0].boxes.id.int().cpu().numpy()
+                    if track_results[0].boxes.id is not None:
+                        track_ids = track_results[0].boxes.id.int().cpu().numpy()
+                    else:
+                        track_ids = np.arange(1, len(boxes) + 1, dtype=int)
 
-                    for box, track_id in zip(boxes, track_ids):
+                    active_count = len(track_ids)
+                    inspect_target_idx = (frame_count % active_count) if active_count > 0 else 0
+
+                    for idx, (box, track_id) in enumerate(zip(boxes, track_ids)):
                         total_workers_seen.add(track_id)
                         px1, py1, px2, py2 = map(int, box)
                         pw = max(1, px2 - px1)
                         ph = max(1, py2 - py1)
 
-                        gear_states = {
-                            'helmet': 'absent',
-                            'mask': 'absent',
-                            'glove': 'unknown',
-                            'shoes': 'unknown'
-                        }
-                        worker_items = []
+                        should_reinspect = (track_id not in WORKER_GEAR_CACHE) or (idx == inspect_target_idx)
 
-                        # A. Match Global PPE Items
-                        for (box_ppe, cls_id, conf) in global_detections:
-                            if overlaps(box_ppe, box, threshold=0.10) > 0.10:
-                                label = PPE_CLASSES.get(cls_id, '')
-                                if not label:
-                                    continue
-                                worker_items.append((box_ppe, label, conf))
-                                
-                                if label == 'mask':
-                                    gear_states['mask'] = 'present'
-                                elif label == 'no_mask':
-                                    gear_states['mask'] = 'absent'
-                                elif label == 'glove':
-                                    gear_states['glove'] = 'present'
-                                elif label == 'no_glove':
-                                    gear_states['glove'] = 'absent'
-                                elif label == 'shoes':
-                                    gear_states['shoes'] = 'present'
-                                elif label == 'no_shoes':
-                                    gear_states['shoes'] = 'absent'
-                                elif label == 'helmet':
-                                    gear_states['helmet'] = 'present'
-                                elif label == 'no_helmet':
-                                    gear_states['helmet'] = 'absent'
+                        if should_reinspect:
+                            gear_states = {
+                                'helmet': 'absent',
+                                'mask': 'absent',
+                                'glove': 'unknown',
+                                'shoes': 'unknown'
+                            }
+                            worker_items = []
 
-                        # B. High-Precision Head Crop Inspection (Respirator / Mask)
-                        hy1 = max(0, py1 - 5)
-                        hy2 = min(h, py1 + int(ph * 0.45))
-                        hx1 = max(0, px1 - 10)
-                        hx2 = min(w, px2 + 10)
-                        head_crop = frame[hy1:hy2, hx1:hx2]
-
-                        # Check 1: Industrial Dual-Cartridge Respirators (Yellow or Pink cartridges)
-                        if head_crop.size > 0:
-                            has_resp, rbox, rtype = detect_industrial_respirator(head_crop)
-                            if has_resp and rbox:
-                                gear_states['mask'] = 'present'
-                                gx1 = hx1 + rbox[0]
-                                gy1 = hy1 + rbox[1]
-                                gx2 = hx1 + rbox[2]
-                                gy2 = hy1 + rbox[3]
-                                worker_items.append(([gx1, gy1, gx2, gy2], "respirator", 0.96))
-
-                        # Check 2: Zoomed Model Prediction for N95 / Surgical Mask / Bare Face (lightweight imgsz=192, ~15ms)
-                        if gear_states['mask'] != 'present' and head_crop.size > 0:
-                            h_res = ppe_model.predict(head_crop, conf=0.15, imgsz=192, verbose=False, device='cpu')
-                            if h_res and len(h_res) > 0:
-                                mask_boxes = []
-                                no_mask_boxes = []
-                                for hbox in h_res[0].boxes:
-                                    hcls = int(hbox.cls[0].item())
-                                    hlabel = PPE_CLASSES.get(hcls, '')
-                                    hconf = float(hbox.conf[0].item())
-                                    cx1, cy1, cx2, cy2 = map(int, hbox.xyxy[0].tolist())
-                                    global_item_box = [hx1 + cx1, hy1 + cy1, hx1 + cx2, hy1 + cy2]
-                                    if hlabel == 'mask':
-                                        mask_boxes.append((global_item_box, "mask", hconf))
-                                    elif hlabel == 'no_mask':
-                                        no_mask_boxes.append((global_item_box, "no_mask", hconf))
-                                    elif hlabel == 'goggles':
-                                        worker_items.append((global_item_box, "goggles", hconf))
-
-                                if mask_boxes:
-                                    best_m = max(mask_boxes, key=lambda x: x[2])
-                                    best_nm = max(no_mask_boxes, key=lambda x: x[2]) if no_mask_boxes else None
-                                    if best_nm is None or best_m[2] >= best_nm[2]:
+                            # A. Match Global PPE Items
+                            for (box_ppe, cls_id, conf) in global_detections:
+                                if overlaps(box_ppe, box, threshold=0.10) > 0.10:
+                                    label = PPE_CLASSES.get(cls_id, '')
+                                    if not label:
+                                        continue
+                                    worker_items.append((box_ppe, label, conf))
+                                    
+                                    if label == 'mask':
                                         gear_states['mask'] = 'present'
-                                        worker_items.append(best_m)
-                                    else:
+                                    elif label == 'no_mask':
                                         gear_states['mask'] = 'absent'
-                                        worker_items.append(best_nm)
-                                elif no_mask_boxes:
-                                    gear_states['mask'] = 'absent'
-                                    worker_items.append(max(no_mask_boxes, key=lambda x: x[2]))
-
-                        # C. High-Precision Hand & Arm Inspection (Gloves / Bare Hands)
-                        ay1 = max(0, py1 + int(ph * 0.20))
-                        ay2 = min(h, py1 + int(ph * 0.90))
-                        ax1 = max(0, px1 - 35)
-                        ax2 = min(w, px2 + 35)
-                        hands_crop = frame[ay1:ay2, ax1:ax2]
-
-                        if hands_crop.size > 0:
-                            a_res = ppe_model.predict(hands_crop, conf=0.14, imgsz=256, verbose=False, device='cpu')
-                            if a_res and len(a_res) > 0:
-                                for abox in a_res[0].boxes:
-                                    acls = int(abox.cls[0].item())
-                                    alabel = PPE_CLASSES.get(acls, '')
-                                    aconf = float(abox.conf[0].item())
-                                    if alabel == 'glove':
+                                    elif label == 'glove':
                                         gear_states['glove'] = 'present'
-                                        acx1, acy1, acx2, acy2 = map(int, abox.xyxy[0].tolist())
-                                        worker_items.append(([ax1 + acx1, ay1 + acy1, ax1 + acx2, ay1 + acy2], "glove", aconf))
-                                    elif alabel == 'no_glove' and gear_states['glove'] != 'present':
+                                    elif label == 'no_glove':
                                         gear_states['glove'] = 'absent'
-                                        acx1, acy1, acx2, acy2 = map(int, abox.xyxy[0].tolist())
-                                        worker_items.append(([ax1 + acx1, ay1 + acy1, ax1 + acx2, ay1 + acy2], "no_glove", aconf))
+                                    elif label == 'shoes':
+                                        gear_states['shoes'] = 'present'
+                                    elif label == 'no_shoes':
+                                        gear_states['shoes'] = 'absent'
+                                    elif label == 'helmet':
+                                        gear_states['helmet'] = 'present'
+                                    elif label == 'no_helmet':
+                                        gear_states['helmet'] = 'absent'
+
+                            # B. High-Precision Head Crop Inspection (Respirator / Mask)
+                            hy1 = max(0, py1 - 5)
+                            hy2 = min(h, py1 + int(ph * 0.45))
+                            hx1 = max(0, px1 - 10)
+                            hx2 = min(w, px2 + 10)
+                            head_crop = frame[hy1:hy2, hx1:hx2]
+
+                            # Check 1: Industrial Dual-Cartridge Respirators (Yellow or Pink cartridges)
+                            if head_crop.size > 0:
+                                has_resp, rbox, rtype = detect_industrial_respirator(head_crop)
+                                if has_resp and rbox:
+                                    gear_states['mask'] = 'present'
+                                    gx1 = hx1 + rbox[0]
+                                    gy1 = hy1 + rbox[1]
+                                    gx2 = hx1 + rbox[2]
+                                    gy2 = hy1 + rbox[3]
+                                    worker_items.append(([gx1, gy1, gx2, gy2], "respirator", 0.96))
+
+                            # Check 2: Zoomed Model Prediction for N95 / Surgical Mask / Bare Face
+                            if gear_states['mask'] != 'present' and head_crop.size > 0:
+                                h_res = ppe_model.predict(head_crop, conf=0.14, imgsz=192, verbose=False, device='cpu')
+                                if h_res and len(h_res) > 0:
+                                    mask_boxes = []
+                                    no_mask_boxes = []
+                                    for hbox in h_res[0].boxes:
+                                        hcls = int(hbox.cls[0].item())
+                                        hlabel = PPE_CLASSES.get(hcls, '')
+                                        hconf = float(hbox.conf[0].item())
+                                        cx1, cy1, cx2, cy2 = map(int, hbox.xyxy[0].tolist())
+                                        global_item_box = [hx1 + cx1, hy1 + cy1, hx1 + cx2, hy1 + cy2]
+                                        if hlabel == 'mask':
+                                            mask_boxes.append((global_item_box, "mask", hconf))
+                                        elif hlabel == 'no_mask':
+                                            no_mask_boxes.append((global_item_box, "no_mask", hconf))
+                                        elif hlabel == 'goggles':
+                                            worker_items.append((global_item_box, "goggles", hconf))
+
+                                    if mask_boxes:
+                                        best_m = max(mask_boxes, key=lambda x: x[2])
+                                        best_nm = max(no_mask_boxes, key=lambda x: x[2]) if no_mask_boxes else None
+                                        if best_nm is None or best_m[2] >= best_nm[2]:
+                                            gear_states['mask'] = 'present'
+                                            worker_items.append(best_m)
+                                        else:
+                                            gear_states['mask'] = 'absent'
+                                            worker_items.append(best_nm)
+                                    elif no_mask_boxes:
+                                        gear_states['mask'] = 'absent'
+                                        worker_items.append(max(no_mask_boxes, key=lambda x: x[2]))
+
+                            # C. High-Precision Hand & Arm Inspection (Gloves / Bare Hands)
+                            ay1 = max(0, py1 + int(ph * 0.20))
+                            ay2 = min(h, py1 + int(ph * 0.90))
+                            ax1 = max(0, px1 - 30)
+                            ax2 = min(w, px2 + 30)
+                            hands_crop = frame[ay1:ay2, ax1:ax2]
+
+                            if hands_crop.size > 0:
+                                a_res = ppe_model.predict(hands_crop, conf=0.14, imgsz=256, verbose=False, device='cpu')
+                                if a_res and len(a_res) > 0:
+                                    for abox in a_res[0].boxes:
+                                        acls = int(abox.cls[0].item())
+                                        alabel = PPE_CLASSES.get(acls, '')
+                                        aconf = float(abox.conf[0].item())
+                                        if alabel == 'glove':
+                                            gear_states['glove'] = 'present'
+                                            acx1, acy1, acx2, acy2 = map(int, abox.xyxy[0].tolist())
+                                            worker_items.append(([ax1 + acx1, ay1 + acy1, ax1 + acx2, ay1 + acy2], "glove", aconf))
+                                        elif alabel == 'no_glove' and gear_states['glove'] != 'present':
+                                            gear_states['glove'] = 'absent'
+                                            acx1, acy1, acx2, acy2 = map(int, abox.xyxy[0].tolist())
+                                            worker_items.append(([ax1 + acx1, ay1 + acy1, ax1 + acx2, ay1 + acy2], "no_glove", aconf))
+
+                            WORKER_GEAR_CACHE[track_id] = (gear_states, worker_items)
+                        else:
+                            gear_states, worker_items = WORKER_GEAR_CACHE[track_id]
 
                         # Determine Missing Items
                         current_missing = []
@@ -479,7 +523,7 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
                     stats_str = f"FPS: {smooth_fps:.1f} | ByteTrack: Active | Active Workers: {len(current_workers_status)} | Logged: {total_violations_logged}"
                     draw_label(frame, stats_str, (10, 25), (40, 40, 40), (0, 255, 255), scale=0.55, thickness=1)
 
-                    cv2.imshow("Roots Industrial PPE Detector (Press Q to Quit, P to Pause)", frame)
+                    cv2.imshow(WIN_TITLE, frame)
                     key = cv2.waitKey(1) & 0xFF
                     if key == ord('q'):
                         print(f"\n{YELLOW}[*] Quit requested by user.{RESET}")
@@ -557,8 +601,9 @@ if __name__ == "__main__":
     parser.add_argument("--video", "-v", type=str, default=None, help="Path to video file or webcam index (default: interactive prompt)")
     parser.add_argument("--headless", action="store_true", help="Run in pure terminal mode without OpenCV GUI window")
     parser.add_argument("--strict", "-s", action="store_true", help="Require all 4 items including helmet and shoes")
-    parser.add_argument("--conf", "-c", type=float, default=0.30, help="Worker person detection confidence")
+    parser.add_argument("--conf", "-c", type=float, default=0.18, help="Worker person detection confidence (default: 0.18)")
     parser.add_argument("--tracker", "-t", type=str, default="bytetrack.yaml", help="Multi-object tracker configuration (default: bytetrack.yaml)")
+    parser.add_argument("--stride", type=int, default=None, help="Frame processing stride (default: 1 for webcam, 2 for video files)")
     args = parser.parse_args()
 
     video_input = args.video
@@ -573,5 +618,6 @@ if __name__ == "__main__":
         show_gui=not args.headless,
         strict_mode=args.strict,
         conf_threshold=args.conf,
-        tracker=args.tracker
+        tracker=args.tracker,
+        stride=args.stride
     )
