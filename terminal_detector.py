@@ -152,6 +152,83 @@ def log_violation(timestamp_str, track_id, missing_items):
     except Exception:
         pass
 
+def is_ip_address(val):
+    import re
+    pattern = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?::[0-9]{1,5})?$'
+    return bool(re.match(pattern, str(val).strip()))
+
+def build_cctv_candidates(ip, user="admin", password=""):
+    auth = f"{user}:{password}@" if (user or password) else ""
+    clean_ip = ip.split(':')[0]
+    port = ip.split(':')[1] if ':' in ip else '554'
+    host = f"{clean_ip}:{port}"
+    return [
+        ('Hikvision Sub-Stream (Ch 102)', f"rtsp://{auth}{host}/Streaming/Channels/102"),
+        ('Dahua / CP Plus Sub-Stream (Sub 1)', f"rtsp://{auth}{host}/cam/realmonitor?channel=1&subtype=1"),
+        ('Uniview Sub-Stream', f"rtsp://{auth}{host}/unicast/c1/s1/live"),
+        ('Generic ONVIF (Live Ch 0)', f"rtsp://{auth}{host}/live/ch0"),
+        ('Hikvision Main-Stream (Ch 101)', f"rtsp://{auth}{host}/Streaming/Channels/101"),
+        ('Dahua / CP Plus Main-Stream (Sub 0)', f"rtsp://{auth}{host}/cam/realmonitor?channel=1&subtype=0"),
+        ('HTTP MJPEG Stream (:8080)', f"http://{auth}{clean_ip}:8080/video"),
+    ]
+
+def resolve_cctv_source(source, user="admin", password="", brand="auto"):
+    source_str = str(source).strip()
+    if is_ip_address(source_str):
+        print(f"\n{BOLD}{CYAN}[*] IP Address Detected: {source_str}. Auto-resolving CCTV stream...{RESET}")
+        candidates = build_cctv_candidates(source_str, user=user, password=password)
+        
+        brand_l = brand.lower().strip() if brand else "auto"
+        if "hik" in brand_l:
+            return candidates[0][1]
+        elif "dahua" in brand_l or "cp" in brand_l:
+            return candidates[1][1]
+        elif "uni" in brand_l:
+            return candidates[2][1]
+        
+        # Fast socket check before probing
+        clean_ip = source_str.split(':')[0]
+        port = int(source_str.split(':')[1]) if ':' in source_str else 554
+        try:
+            import socket
+            s = socket.create_connection((clean_ip, port), timeout=0.8)
+            s.close()
+            port_open = True
+        except Exception:
+            port_open = False
+
+        if not port_open:
+            print(f"\n{RED}[ERROR] Port {port} on IP {clean_ip} is not responding.{RESET}")
+            print(f"Please check:")
+            print(f"  1. Is the camera powered on and connected to the network?")
+            print(f"  2. Is your PC on the same subnet as the camera?")
+            print(f"  3. Verify you can ping {clean_ip} from your terminal.")
+            print(f"  4. Is the RTSP service (Port 554) enabled in the camera settings?\n")
+            sys.exit(1)
+
+        # Test candidate streams quickly
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;3000000"
+        for label, url in candidates[:4]:
+            masked_url = url
+            if "@" in url:
+                pre, post = url.split("@", 1)
+                masked_url = f"{pre.split('//')[0]}//***:***@{post}"
+            print(f"  * Probing {label}: {masked_url}")
+            test_cap = cv2.VideoCapture(url)
+            if test_cap.isOpened():
+                ret, _ = test_cap.read()
+                test_cap.release()
+                if ret:
+                    print(f"{GREEN}[✓] Successfully connected to {label}!{RESET}\n")
+                    return url
+            test_cap.release()
+            
+        print(f"{YELLOW}[!] Auto-probe could not verify stream. Using standard RTSP URL:{RESET}")
+        print(f"    {candidates[0][1]}\n")
+        return candidates[0][1]
+
+    return source
+
 def select_video_interactive():
     candidates = [
         r"E:\New folder (2)\CCTV 3.mp4",
@@ -162,7 +239,7 @@ def select_video_interactive():
     
     print(f"\n{BOLD}{CYAN}=== Select Video Source ==={RESET}")
     print(f"  {BOLD}[0]{RESET} {GREEN}Live Webcam #0 (USB / Built-in Camera){RESET}")
-    print(f"  {BOLD}[R]{RESET} {MAGENTA}Live External CCTV Server / IP Camera (RTSP / HTTP stream){RESET}")
+    print(f"  {BOLD}[R]{RESET} {MAGENTA}Live External CCTV Server / IP Camera (Enter IP or RTSP){RESET}")
     for idx, path in enumerate(existing):
         sz = os.path.getsize(path) / (1024 * 1024)
         tag = f"{GREEN}[FINE-TUNED]{RESET}" if "CCTV 3" in path else ""
@@ -173,21 +250,24 @@ def select_video_interactive():
     
     try:
         if choice.upper() == "R":
-            print(f"\n{YELLOW}Examples of CCTV RTSP URLs:{RESET}")
-            print("  * Hikvision: rtsp://admin:password@192.168.1.64:554/Streaming/Channels/102")
-            print("  * Dahua:     rtsp://admin:password@192.168.1.108:554/cam/realmonitor?channel=1&subtype=1")
-            print("  * CP Plus:   rtsp://admin:password@192.168.1.250:554/cam/realmonitor?channel=1&subtype=1")
-            print("  * Uniview:   rtsp://admin:password@192.168.1.13:554/unicast/c1/s1/live")
-            print("  * Axis:      rtsp://root:password@192.168.1.10/axis-media/media.amp")
-            url = input("\nEnter CCTV RTSP / Stream URL: ").strip().strip('"').strip("'")
-            return url
+            print(f"\n{BOLD}{CYAN}=== Connect via IP Address or RTSP URL ==={RESET}")
+            ip_or_url = input("Enter Camera IP Address (e.g., 192.168.1.64) OR Full RTSP URL: ").strip().strip('"').strip("'")
+            if is_ip_address(ip_or_url):
+                user = input("Enter Username (default: admin): ").strip() or "admin"
+                pwd = input("Enter Password (press Enter if none): ").strip()
+                brand = input("Brand [1=Hikvision, 2=Dahua/CP Plus, 3=Uniview, 4=Auto-Detect] (default: 4): ").strip()
+                brand_map = {"1": "hikvision", "2": "dahua", "3": "uniview", "4": "auto"}
+                return resolve_cctv_source(ip_or_url, user=user, password=pwd, brand=brand_map.get(brand, "auto"))
+            return ip_or_url
         elif choice == "0":
             return 0
         choice_idx = int(choice) - 1
         if 0 <= choice_idx < len(existing):
             return existing[choice_idx]
         else:
-            custom_path = input("Enter full path to video file or stream URL: ").strip().strip('"').strip("'")
+            custom_path = input("Enter full path to video file or stream URL / IP: ").strip().strip('"').strip("'")
+            if is_ip_address(custom_path):
+                return resolve_cctv_source(custom_path)
             return custom_path
     except Exception:
         return 0
@@ -634,20 +714,28 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Roots Industrial PPE Compliance Detector - Industry Engine")
-    parser.add_argument("--video", "-v", type=str, default=None, help="Path to video file or webcam index (default: interactive prompt)")
+    parser.add_argument("--video", "-v", type=str, default=None, help="Path to video file, webcam index, or RTSP/IP stream")
+    parser.add_argument("--ip", type=str, default=None, help="Direct CCTV IP address (e.g. 192.168.1.64)")
+    parser.add_argument("--user", "-u", type=str, default="admin", help="CCTV camera username (default: admin)")
+    parser.add_argument("--password", "-p", type=str, default="", help="CCTV camera password")
+    parser.add_argument("--brand", "-b", type=str, default="auto", help="CCTV brand: hikvision, dahua, uniview, axis, auto")
     parser.add_argument("--headless", action="store_true", help="Run in pure terminal mode without OpenCV GUI window")
     parser.add_argument("--strict", "-s", action="store_true", help="Require all 4 items including helmet and shoes")
     parser.add_argument("--conf", "-c", type=float, default=0.18, help="Worker person detection confidence (default: 0.18)")
     parser.add_argument("--tracker", "-t", type=str, default="bytetrack.yaml", help="Multi-object tracker configuration (default: bytetrack.yaml)")
-    parser.add_argument("--stride", type=int, default=None, help="Frame processing stride (default: 1 for webcam, 2 for video files)")
+    parser.add_argument("--stride", type=int, default=None, help="Frame processing stride (default: 1 for webcam/RTSP, 2 for video files)")
     args = parser.parse_args()
 
-    video_input = args.video
-    if video_input is None:
-        video_input = select_video_interactive()
-    else:
-        if video_input.isdigit():
+    if args.ip:
+        video_input = resolve_cctv_source(args.ip, user=args.user, password=args.password, brand=args.brand)
+    elif args.video is not None:
+        video_input = args.video
+        if is_ip_address(video_input):
+            video_input = resolve_cctv_source(video_input, user=args.user, password=args.password, brand=args.brand)
+        elif video_input.isdigit():
             video_input = int(video_input)
+    else:
+        video_input = select_video_interactive()
 
     run_cli_detector(
         video_source=video_input,
