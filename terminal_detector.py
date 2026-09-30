@@ -157,26 +157,39 @@ def is_ip_address(val):
     pattern = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?::[0-9]{1,5})?$'
     return bool(re.match(pattern, str(val).strip()))
 
-def build_cctv_candidates(ip, user="admin", password=""):
+def parse_channel_number(ch):
+    if ch is None:
+        return 1
+    # Strip any 'D', 'd', 'CH', 'ch', 'c' prefix (e.g. 'D29' -> 29)
+    cleaned = re.sub(r'^[DdCcHh]+', '', str(ch).strip())
+    try:
+        return int(cleaned)
+    except ValueError:
+        return 1
+
+def build_cctv_candidates(ip, user="admin", password="", channel=1):
     auth = f"{user}:{password}@" if (user or password) else ""
     clean_ip = ip.split(':')[0]
     port = ip.split(':')[1] if ':' in ip else '554'
     host = f"{clean_ip}:{port}"
+    ch = parse_channel_number(channel)
     return [
-        ('Hikvision Sub-Stream (Ch 102)', f"rtsp://{auth}{host}/Streaming/Channels/102"),
-        ('Dahua / CP Plus Sub-Stream (Sub 1)', f"rtsp://{auth}{host}/cam/realmonitor?channel=1&subtype=1"),
-        ('Uniview Sub-Stream', f"rtsp://{auth}{host}/unicast/c1/s1/live"),
-        ('Generic ONVIF (Live Ch 0)', f"rtsp://{auth}{host}/live/ch0"),
-        ('Hikvision Main-Stream (Ch 101)', f"rtsp://{auth}{host}/Streaming/Channels/101"),
-        ('Dahua / CP Plus Main-Stream (Sub 0)', f"rtsp://{auth}{host}/cam/realmonitor?channel=1&subtype=0"),
-        ('HTTP MJPEG Stream (:8080)', f"http://{auth}{clean_ip}:8080/video"),
+        (f'Hikvision Sub-Stream (D{ch} / Ch {ch}02)', f"rtsp://{auth}{host}/Streaming/Channels/{ch}02"),
+        (f'Dahua / CP Plus Sub-Stream (D{ch})', f"rtsp://{auth}{host}/cam/realmonitor?channel={ch}&subtype=1"),
+        (f'Uniview Sub-Stream (D{ch})', f"rtsp://{auth}{host}/unicast/c{ch}/s1/live"),
+        (f'Generic ONVIF (D{ch})', f"rtsp://{auth}{host}/live/ch{ch}"),
+        (f'Hikvision Main-Stream (D{ch} / Ch {ch}01)', f"rtsp://{auth}{host}/Streaming/Channels/{ch}01"),
+        (f'Dahua / CP Plus Main-Stream (D{ch})', f"rtsp://{auth}{host}/cam/realmonitor?channel={ch}&subtype=0"),
+        (f'HTTP MJPEG Stream (:8080)', f"http://{auth}{clean_ip}:8080/video"),
     ]
 
-def resolve_cctv_source(source, user="admin", password="", brand="auto"):
+def resolve_cctv_source(source, user="admin", password="", brand="auto", channel=1):
     source_str = str(source).strip()
     if is_ip_address(source_str):
-        print(f"\n{BOLD}{CYAN}[*] IP Address Detected: {source_str}. Auto-resolving CCTV stream...{RESET}")
-        candidates = build_cctv_candidates(source_str, user=user, password=password)
+        ch_num = parse_channel_number(channel)
+        print(f"\n{BOLD}{CYAN}[*] IP Address Detected: {source_str} | NVR Digital Channel: [D{ch_num}]{RESET}")
+        print(f"[*] Auto-resolving CCTV stream for Camera D{ch_num}...")
+        candidates = build_cctv_candidates(source_str, user=user, password=password, channel=ch_num)
         
         brand_l = brand.lower().strip() if brand else "auto"
         if "hik" in brand_l:
@@ -250,14 +263,15 @@ def select_video_interactive():
     
     try:
         if choice.upper() == "R":
-            print(f"\n{BOLD}{CYAN}=== Connect via IP Address or RTSP URL ==={RESET}")
-            ip_or_url = input("Enter Camera IP Address (e.g., 192.168.1.64) OR Full RTSP URL: ").strip().strip('"').strip("'")
+            print(f"\n{BOLD}{CYAN}=== Connect to CCTV NVR / IP Camera ==={RESET}")
+            ip_or_url = input("Enter NVR / Camera IP Address (e.g., 192.168.1.100) OR Full RTSP URL: ").strip().strip('"').strip("'")
             if is_ip_address(ip_or_url):
+                ch_in = input("Enter Digital Channel / Camera Number [e.g. 29 for D29] (default: 29): ").strip() or "29"
                 user = input("Enter Username (default: admin): ").strip() or "admin"
                 pwd = input("Enter Password (press Enter if none): ").strip()
                 brand = input("Brand [1=Hikvision, 2=Dahua/CP Plus, 3=Uniview, 4=Auto-Detect] (default: 4): ").strip()
                 brand_map = {"1": "hikvision", "2": "dahua", "3": "uniview", "4": "auto"}
-                return resolve_cctv_source(ip_or_url, user=user, password=pwd, brand=brand_map.get(brand, "auto"))
+                return resolve_cctv_source(ip_or_url, user=user, password=pwd, brand=brand_map.get(brand, "auto"), channel=ch_in)
             return ip_or_url
         elif choice == "0":
             return 0
@@ -715,7 +729,8 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Roots Industrial PPE Compliance Detector - Industry Engine")
     parser.add_argument("--video", "-v", type=str, default=None, help="Path to video file, webcam index, or RTSP/IP stream")
-    parser.add_argument("--ip", type=str, default=None, help="Direct CCTV IP address (e.g. 192.168.1.64)")
+    parser.add_argument("--ip", type=str, default=None, help="Direct CCTV NVR / IP address (e.g. 192.168.1.100)")
+    parser.add_argument("--channel", "-ch", type=str, default="29", help="Digital camera channel on NVR [e.g. 29 for D29] (default: 29)")
     parser.add_argument("--user", "-u", type=str, default="admin", help="CCTV camera username (default: admin)")
     parser.add_argument("--password", "-p", type=str, default="", help="CCTV camera password")
     parser.add_argument("--brand", "-b", type=str, default="auto", help="CCTV brand: hikvision, dahua, uniview, axis, auto")
@@ -727,11 +742,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.ip:
-        video_input = resolve_cctv_source(args.ip, user=args.user, password=args.password, brand=args.brand)
+        video_input = resolve_cctv_source(args.ip, user=args.user, password=args.password, brand=args.brand, channel=args.channel)
     elif args.video is not None:
         video_input = args.video
         if is_ip_address(video_input):
-            video_input = resolve_cctv_source(video_input, user=args.user, password=args.password, brand=args.brand)
+            video_input = resolve_cctv_source(video_input, user=args.user, password=args.password, brand=args.brand, channel=args.channel)
         elif video_input.isdigit():
             video_input = int(video_input)
     else:
