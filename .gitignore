@@ -29,3 +29,8 @@ backend/runs/
 
 # Logs
 *.log
+
+# Backup weight files
+backend/*backup*.pt
+backend/*clean*.pt
+backend/original_*.pt

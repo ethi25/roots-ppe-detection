@@ -3,6 +3,7 @@ import sys
 import time
 import argparse
 import csv
+import re
 from datetime import datetime
 from collections import deque
 import cv2
@@ -11,6 +12,15 @@ from ultralytics import YOLO
 
 # Enable ANSI escape sequences on Windows
 os.system('')
+
+# Ensure immediate unbuffered terminal prints
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
+CURRENT_CAMERA_NAME = ""
 
 # ANSI Colors for Terminal
 RESET = "\033[0m"
@@ -153,21 +163,46 @@ def log_violation(timestamp_str, track_id, missing_items):
         pass
 
 def is_ip_address(val):
-    import re
     pattern = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?::[0-9]{1,5})?$'
     return bool(re.match(pattern, str(val).strip()))
 
 def parse_channel_number(ch):
     if ch is None:
-        return 1
+        return 29
     # Strip any 'D', 'd', 'CH', 'ch', 'c' prefix (e.g. 'D29' -> 29)
     cleaned = re.sub(r'^[DdCcHh]+', '', str(ch).strip())
     try:
         return int(cleaned)
     except ValueError:
-        return 1
+        return 29
 
-def build_cctv_candidates(ip, user="admin", password="", channel=1):
+def parse_cctv_composite_string(source_str):
+    """
+    Parses composite strings such as:
+    http://192.168.127.5/doc/index.html#/preview,admin,dmin@123,[D29] POWDER COATING OFFICE AREA
+    or 192.168.127.5,admin,dmin@123,29
+    """
+    s = str(source_str).strip().strip('"').strip("'")
+    if ',' in s:
+        parts = [p.strip() for p in s.split(',')]
+        ip_match = re.search(r'([0-9]{1,3}(?:\.[0-9]{1,3}){3}(?::[0-9]{1,5})?)', parts[0])
+        ip = ip_match.group(1) if ip_match else parts[0]
+        user = parts[1] if len(parts) > 1 and parts[1] else "admin"
+        pwd = parts[2] if len(parts) > 2 else ""
+        ch = 29
+        area = ""
+        if len(parts) > 3:
+            raw_ch = parts[3]
+            ch_match = re.search(r'\[?[DdCcHh]?([0-9]+)\]?', raw_ch)
+            if ch_match:
+                ch = int(ch_match.group(1))
+            area = re.sub(r'\[.*?\]', '', raw_ch).strip()
+            if not area:
+                area = f"Digital Channel {ch}"
+        return ip, user, pwd, ch, area
+    return None
+
+def build_cctv_candidates(ip, user="admin", password="", channel=29):
     auth = f"{user}:{password}@" if (user or password) else ""
     clean_ip = ip.split(':')[0]
     port = ip.split(':')[1] if ':' in ip else '554'
@@ -183,16 +218,36 @@ def build_cctv_candidates(ip, user="admin", password="", channel=1):
         (f'HTTP MJPEG Stream (:8080)', f"http://{auth}{clean_ip}:8080/video"),
     ]
 
-def resolve_cctv_source(source, user="admin", password="", brand="auto", channel=1):
-    source_str = str(source).strip()
-    if is_ip_address(source_str):
-        ch_num = parse_channel_number(channel)
-        print(f"\n{BOLD}{CYAN}[*] IP Address Detected: {source_str} | NVR Digital Channel: [D{ch_num}]{RESET}")
-        print(f"[*] Auto-resolving CCTV stream for Camera D{ch_num}...")
-        candidates = build_cctv_candidates(source_str, user=user, password=password, channel=ch_num)
+def resolve_cctv_source(source, user="admin", password="", brand="auto", channel=29, area=None):
+    global CURRENT_CAMERA_NAME
+    source_str = str(source).strip().strip('"').strip("'")
+
+    parsed = parse_cctv_composite_string(source_str)
+    if parsed:
+        p_ip, p_user, p_pwd, p_ch, p_area = parsed
+        source_str = p_ip
+        if p_user: user = p_user
+        if p_pwd is not None: password = p_pwd
+        if p_ch: channel = p_ch
+        if p_area: area = p_area
+
+    ch_num = parse_channel_number(channel)
+    if area:
+        CURRENT_CAMERA_NAME = f"[D{ch_num}] {area}"
+    else:
+        CURRENT_CAMERA_NAME = f"Camera [D{ch_num}]"
+
+    if is_ip_address(source_str) or source_str.startswith(("http://", "https://")):
+        ip_m = re.search(r'([0-9]{1,3}(?:\.[0-9]{1,3}){3}(?::[0-9]{1,5})?)', source_str)
+        clean_ip = ip_m.group(1) if ip_m else source_str
+        
+        print(f"\n{BOLD}{CYAN}[*] CCTV Connection: {clean_ip} | Channel: [D{ch_num}] {f'({area})' if area else ''}{RESET}")
+        print(f"[*] Auto-resolving CCTV RTSP stream for Camera D{ch_num}...")
+        candidates = build_cctv_candidates(clean_ip, user=user, password=password, channel=ch_num)
         
         brand_l = brand.lower().strip() if brand else "auto"
         if "hik" in brand_l:
+            print(f"{GREEN}[✓] Using Hikvision Sub-Stream: rtsp://***:***@{clean_ip}:554/Streaming/Channels/{ch_num}02{RESET}\n")
             return candidates[0][1]
         elif "dahua" in brand_l or "cp" in brand_l:
             return candidates[1][1]
@@ -200,23 +255,22 @@ def resolve_cctv_source(source, user="admin", password="", brand="auto", channel
             return candidates[2][1]
         
         # Fast socket check before probing
-        clean_ip = source_str.split(':')[0]
-        port = int(source_str.split(':')[1]) if ':' in source_str else 554
+        port = int(clean_ip.split(':')[1]) if ':' in clean_ip else 554
+        pure_ip = clean_ip.split(':')[0]
         try:
             import socket
-            s = socket.create_connection((clean_ip, port), timeout=0.8)
+            s = socket.create_connection((pure_ip, port), timeout=0.8)
             s.close()
             port_open = True
         except Exception:
             port_open = False
 
         if not port_open:
-            print(f"\n{RED}[ERROR] Port {port} on IP {clean_ip} is not responding.{RESET}")
+            print(f"\n{RED}[ERROR] RTSP Port {port} on IP {pure_ip} is not responding.{RESET}")
             print(f"Please check:")
-            print(f"  1. Is the camera powered on and connected to the network?")
-            print(f"  2. Is your PC on the same subnet as the camera?")
-            print(f"  3. Verify you can ping {clean_ip} from your terminal.")
-            print(f"  4. Is the RTSP service (Port 554) enabled in the camera settings?\n")
+            print(f"  1. Is your PC connected to the CCTV / Factory Wi-Fi network?")
+            print(f"  2. Verify you can ping {pure_ip} from your terminal.")
+            print(f"  3. Is the RTSP service (Port 554) active on the NVR?\n")
             sys.exit(1)
 
         # Test candidate streams quickly
@@ -236,7 +290,7 @@ def resolve_cctv_source(source, user="admin", password="", brand="auto", channel
                     return url
             test_cap.release()
             
-        print(f"{YELLOW}[!] Auto-probe could not verify stream. Using standard RTSP URL:{RESET}")
+        print(f"{YELLOW}[!] Auto-probe fallback: Using standard Hikvision RTSP Sub-Stream:{RESET}")
         print(f"    {candidates[0][1]}\n")
         return candidates[0][1]
 
@@ -251,7 +305,8 @@ def select_video_interactive():
     existing = [p for p in candidates if os.path.exists(p)]
     
     print(f"\n{BOLD}{CYAN}=== Select Video Source ==={RESET}")
-    print(f"  {BOLD}[0]{RESET} {GREEN}Live Webcam #0 (USB / Built-in Camera){RESET}")
+    print(f"  {BOLD}[D]{RESET} {GREEN}{BOLD}[D29] POWDER COATING OFFICE AREA{RESET} (Live 192.168.127.5 NVR Stream)")
+    print(f"  {BOLD}[0]{RESET} {CYAN}Live Webcam #0 (USB / Built-in Camera){RESET}")
     print(f"  {BOLD}[R]{RESET} {MAGENTA}Live External CCTV Server / IP Camera (Enter IP or RTSP){RESET}")
     for idx, path in enumerate(existing):
         sz = os.path.getsize(path) / (1024 * 1024)
@@ -259,19 +314,30 @@ def select_video_interactive():
         print(f"  {BOLD}[{idx + 1}]{RESET} {path} ({sz:.1f} MB) {tag}")
     print(f"  {BOLD}[{len(existing) + 1}]{RESET} Enter custom video file path")
     
-    choice = input(f"\nEnter choice [0-{len(existing)+1} or R]: ").strip() or "0"
+    choice = input(f"\nEnter choice [D, 0, R, or 1-{len(existing)+1}] (default: D): ").strip() or "D"
     
     try:
-        if choice.upper() == "R":
+        if choice.upper() == "D":
+            return resolve_cctv_source(
+                "192.168.127.5",
+                user="admin",
+                password="dmin@123",
+                brand="hikvision",
+                channel=29,
+                area="POWDER COATING OFFICE AREA"
+            )
+        elif choice.upper() == "R":
             print(f"\n{BOLD}{CYAN}=== Connect to CCTV NVR / IP Camera ==={RESET}")
-            ip_or_url = input("Enter NVR / Camera IP Address (e.g., 192.168.1.100) OR Full RTSP URL: ").strip().strip('"').strip("'")
-            if is_ip_address(ip_or_url):
+            ip_or_url = input("Enter NVR / Camera IP Address (e.g., 192.168.127.5) OR Full string: ").strip().strip('"').strip("'")
+            if parse_cctv_composite_string(ip_or_url):
+                return resolve_cctv_source(ip_or_url)
+            elif is_ip_address(ip_or_url):
                 ch_in = input("Enter Digital Channel / Camera Number [e.g. 29 for D29] (default: 29): ").strip() or "29"
                 user = input("Enter Username (default: admin): ").strip() or "admin"
-                pwd = input("Enter Password (press Enter if none): ").strip()
-                brand = input("Brand [1=Hikvision, 2=Dahua/CP Plus, 3=Uniview, 4=Auto-Detect] (default: 4): ").strip()
+                pwd = input("Enter Password (default: dmin@123): ").strip() or "dmin@123"
+                brand = input("Brand [1=Hikvision, 2=Dahua/CP Plus, 3=Uniview, 4=Auto-Detect] (default: 1): ").strip() or "1"
                 brand_map = {"1": "hikvision", "2": "dahua", "3": "uniview", "4": "auto"}
-                return resolve_cctv_source(ip_or_url, user=user, password=pwd, brand=brand_map.get(brand, "auto"), channel=ch_in)
+                return resolve_cctv_source(ip_or_url, user=user, password=pwd, brand=brand_map.get(brand, "hikvision"), channel=ch_in)
             return ip_or_url
         elif choice == "0":
             return 0
@@ -280,7 +346,7 @@ def select_video_interactive():
             return existing[choice_idx]
         else:
             custom_path = input("Enter full path to video file or stream URL / IP: ").strip().strip('"').strip("'")
-            if is_ip_address(custom_path):
+            if parse_cctv_composite_string(custom_path) or is_ip_address(custom_path):
                 return resolve_cctv_source(custom_path)
             return custom_path
     except Exception:
@@ -294,10 +360,14 @@ def draw_label(img, text, pt, bg_color, text_color=(255, 255, 255), scale=0.5, t
     cv2.rectangle(img, (x, y - th - 6), (x + tw + 6, y + baseline), bg_color, -1)
     cv2.putText(img, text, (x + 3, y - 3), cv2.FONT_HERSHEY_SIMPLEX, scale, text_color, thickness, cv2.LINE_AA)
 
-def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_threshold=0.18, tracker="bytetrack.yaml", stride=None):
+def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_threshold=0.18, tracker="bytetrack.yaml", stride=None, camera_name=None):
+    global CURRENT_CAMERA_NAME
+    active_name = camera_name or CURRENT_CAMERA_NAME
     print(f"\n{BOLD}{CYAN}========================================================================{RESET}")
     print(f"{BOLD}{WHITE}   ROOTS INDUSTRIAL PPE COMPLIANCE DETECTOR - INDUSTRY ENGINE{RESET}")
     print(f"{BOLD}{CYAN}========================================================================{RESET}")
+    if active_name:
+        print(f"[*] Monitored Camera Location: {YELLOW}{BOLD}{active_name}{RESET}")
 
     # Load Model Weights
     weights_path = os.path.join(BACKEND_DIR, "yolov8m-ppe.pt")
@@ -337,7 +407,7 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_live else 0
     
     if is_rtsp or is_http_stream:
-        src_label = f"Live CCTV Stream ({video_str[:35]}...)" if len(video_str) > 35 else f"Live CCTV Stream ({video_str})"
+        src_label = f"Live CCTV [{active_name}]" if active_name else (f"Live CCTV Stream ({video_str[:35]}...)" if len(video_str) > 35 else f"Live CCTV Stream ({video_str})")
     elif is_webcam:
         src_label = f"Webcam #{video_source}"
     else:
@@ -371,7 +441,7 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
     WORKER_GEAR_CACHE = {}
     last_global_detections = []
 
-    WIN_TITLE = "Roots Industrial PPE Detector (Press Q to Quit, P to Pause)"
+    WIN_TITLE = f"Roots Industrial PPE Detector - {active_name} (Press Q to Quit, P to Pause)" if active_name else "Roots Industrial PPE Detector (Press Q to Quit, P to Pause)"
     if show_gui:
         cv2.namedWindow(WIN_TITLE, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(WIN_TITLE, 1280, 720)
@@ -650,7 +720,8 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
                             draw_label(frame, f"{label_name.upper()} {conf:.2f}", (ix1, iy1 - 4), item_color, text_c, scale=0.45, thickness=1)
 
                     # Top stats bar on video window
-                    stats_str = f"FPS: {smooth_fps:.1f} | ByteTrack: Active | Active Workers: {len(current_workers_status)} | Logged: {total_violations_logged}"
+                    cam_tag = f"CAM: {active_name} | " if active_name else ""
+                    stats_str = f"{cam_tag}FPS: {smooth_fps:.1f} | ByteTrack: Active | Workers: {len(current_workers_status)} | Logged: {total_violations_logged}"
                     draw_label(frame, stats_str, (10, 25), (40, 40, 40), (0, 255, 255), scale=0.55, thickness=1)
 
                     cv2.imshow(WIN_TITLE, frame)
@@ -729,11 +800,12 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Roots Industrial PPE Compliance Detector - Industry Engine")
     parser.add_argument("--video", "-v", type=str, default=None, help="Path to video file, webcam index, or RTSP/IP stream")
-    parser.add_argument("--ip", type=str, default=None, help="Direct CCTV NVR / IP address (e.g. 192.168.1.100)")
+    parser.add_argument("--ip", type=str, default=None, help="Direct CCTV NVR / IP address (e.g. 192.168.127.5)")
     parser.add_argument("--channel", "-ch", type=str, default="29", help="Digital camera channel on NVR [e.g. 29 for D29] (default: 29)")
     parser.add_argument("--user", "-u", type=str, default="admin", help="CCTV camera username (default: admin)")
-    parser.add_argument("--password", "-p", type=str, default="", help="CCTV camera password")
-    parser.add_argument("--brand", "-b", type=str, default="auto", help="CCTV brand: hikvision, dahua, uniview, axis, auto")
+    parser.add_argument("--password", "-p", type=str, default="dmin@123", help="CCTV camera password (default: dmin@123)")
+    parser.add_argument("--brand", "-b", type=str, default="hikvision", help="CCTV brand: hikvision, dahua, uniview, axis, auto")
+    parser.add_argument("--area", "-a", type=str, default="POWDER COATING OFFICE AREA", help="Monitored camera area label")
     parser.add_argument("--headless", action="store_true", help="Run in pure terminal mode without OpenCV GUI window")
     parser.add_argument("--strict", "-s", action="store_true", help="Require all 4 items including helmet and shoes")
     parser.add_argument("--conf", "-c", type=float, default=0.18, help="Worker person detection confidence (default: 0.18)")
@@ -742,12 +814,26 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.ip:
-        video_input = resolve_cctv_source(args.ip, user=args.user, password=args.password, brand=args.brand, channel=args.channel)
+        video_input = resolve_cctv_source(
+            args.ip,
+            user=args.user,
+            password=args.password,
+            brand=args.brand,
+            channel=args.channel,
+            area=args.area
+        )
     elif args.video is not None:
         video_input = args.video
-        if is_ip_address(video_input):
-            video_input = resolve_cctv_source(video_input, user=args.user, password=args.password, brand=args.brand, channel=args.channel)
-        elif video_input.isdigit():
+        if parse_cctv_composite_string(video_input) or is_ip_address(video_input) or str(video_input).startswith(("http://", "https://")):
+            video_input = resolve_cctv_source(
+                video_input,
+                user=args.user,
+                password=args.password,
+                brand=args.brand,
+                channel=args.channel,
+                area=args.area
+            )
+        elif str(video_input).isdigit():
             video_input = int(video_input)
     else:
         video_input = select_video_interactive()
@@ -758,5 +844,6 @@ if __name__ == "__main__":
         strict_mode=args.strict,
         conf_threshold=args.conf,
         tracker=args.tracker,
-        stride=args.stride
+        stride=args.stride,
+        camera_name=args.area or CURRENT_CAMERA_NAME
     )
