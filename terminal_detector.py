@@ -166,70 +166,35 @@ def detect_face_covering(head_crop):
     return False, None
 
 
-def detect_dark_gloves(hand_crop):
+def detect_bare_hands_in_zone(zone_crop):
     """
-    COLOR-BASED DARK/BLACK GLOVE DETECTOR for low-res CCTV:
-    Detects: black, dark navy, dark green work gloves.
-    Focuses strictly on the hand/palm region of the crop.
-    Returns: (has_glove, bounding_box)
+    SKIN-EXPOSURE DETECTOR for hand zones:
+    Detects exposed skin (bare hand / wrist) within a crop.
+    If significant skin-colored area is found in the hand region,
+    the worker is likely NOT wearing gloves.
+    Returns: (has_bare_skin, ratio_of_skin_pixels)
     """
-    if hand_crop is None or hand_crop.size == 0:
-        return False, None
+    if zone_crop is None or zone_crop.size == 0:
+        return False, 0.0
 
-    hh, hw = hand_crop.shape[:2]
+    zz = cv2.GaussianBlur(zone_crop, (3, 3), 0)
+    hsv = cv2.cvtColor(zz, cv2.COLOR_BGR2HSV)
 
-    # 2x upscale for tiny hand crops from distant CCTV cameras
-    scale = 2 if max(hh, hw) < 70 else 1
-    if scale > 1:
-        hand_crop = cv2.resize(hand_crop, (hw * scale, hh * scale), interpolation=cv2.INTER_LINEAR)
-        hh, hw = hand_crop.shape[:2]
+    # Broad skin-tone range (covers light to medium-dark complexions)
+    skin_lo  = cv2.inRange(hsv, np.array([  0, 18,  70]), np.array([ 22, 170, 255]))
+    skin_hi  = cv2.inRange(hsv, np.array([165, 18,  70]), np.array([179, 170, 255]))
+    skin = cv2.bitwise_or(skin_lo, skin_hi)
 
-    blurred = cv2.GaussianBlur(hand_crop, (3, 3), 0)
-    hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+    # Clean noise
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    skin = cv2.morphologyEx(skin, cv2.MORPH_CLOSE, kernel)
 
-    # Black / very dark work gloves (any hue, low value)
-    black    = cv2.inRange(hsv, np.array([  0,   0,   0]), np.array([179, 255,  60]))
-
-    # Dark navy / dark blue gloves
-    dk_blue  = cv2.inRange(hsv, np.array([ 90,  40,  20]), np.array([130, 255,  90]))
-
-    # Dark green rubber gloves
-    dk_green = cv2.inRange(hsv, np.array([ 38,  40,  20]), np.array([ 88, 255,  90]))
-
-    # Yellow / orange hi-vis gloves
-    hiviz    = cv2.inRange(hsv, np.array([ 15, 120,  80]), np.array([ 38, 255, 255]))
-
-    # White / light gray latex gloves
-    white_gl = cv2.inRange(hsv, np.array([  0,   0, 160]), np.array([179,  40, 255]))
-
-    combined = black
-    for layer in (dk_blue, dk_green, hiviz, white_gl):
-        combined = cv2.bitwise_or(combined, layer)
-
-    # Morphological close to fill gaps from compression artifacts
-    ksize = 7 if scale > 1 else 5
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
-    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
-    combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN,
-                                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
-
-    contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    min_area = 70 * (scale ** 2)
-    valid = [cv2.boundingRect(c) for c in contours if cv2.contourArea(c) > min_area]
-
-    if valid:
-        # Use the largest contiguous region
-        bx, by, bw, bh = max(valid, key=lambda b: b[2] * b[3])
-        pad = 4 // scale
-        box = [
-            max(0, bx - pad) // scale,
-            max(0, by - pad) // scale,
-            min(hw, bx + bw + pad) // scale,
-            min(hh, by + bh + pad) // scale,
-        ]
-        return True, box
-
-    return False, None
+    total_px = zone_crop.shape[0] * zone_crop.shape[1]
+    if total_px == 0:
+        return False, 0.0
+    skin_ratio = np.count_nonzero(skin) / total_px
+    # >8% skin pixels in the hand zone = likely bare hand
+    return skin_ratio > 0.08, skin_ratio
 
 
 def overlaps(box1, box2, threshold=0.10):
@@ -719,63 +684,81 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
                                         gear_states['mask'] = 'absent'
                                         worker_items.append(max(no_mask_boxes, key=lambda x: x[2]))
 
-                            # C. Glove Inspection — focused PALM zones only
-                            # Three crops: left hand, right hand, bottom-center.
-                            # This avoids the full-body crop that mis-reads dark clothing as no-glove.
+                            # C. Glove Inspection — Arm-edge zones only (avoid legs/torso)
+                            #
+                            # Workers at machines have hands at their SIDES or reaching FORWARD,
+                            # in the UPPER-TO-MID part of the bounding box — NOT the lower legs area.
+                            # We scan FOUR narrow strips:
+                            #   L-arm: left 30% of person box, rows 25%-75%
+                            #   R-arm: right 30% of person box, rows 25%-75%
+                            #   L-reach: left half, rows 40%-85%
+                            #   R-reach: right half, rows 40%-85%
                             pw = max(1, px2 - px1)
-                            hand_zone_y1 = max(0, py1 + int(ph * 0.55))
-                            hand_zone_y2 = min(h, py2 + 10)
 
-                            hand_zones = [
-                                # Left hand / wrist area
-                                (max(0, px1 - 20), hand_zone_y1,
-                                 min(w, px1 + int(pw * 0.50)), hand_zone_y2),
-                                # Right hand / wrist area
-                                (max(0, px1 + int(pw * 0.50)), hand_zone_y1,
-                                 min(w, px2 + 20), hand_zone_y2),
-                                # Bottom-center (hands reaching forward at a machine)
-                                (max(0, px1 + int(pw * 0.10)), max(0, py1 + int(ph * 0.70)),
-                                 min(w, px2 - int(pw * 0.10)), hand_zone_y2),
+                            arm_zones = [
+                                # Left arm strip (rows 25-75% of person height)
+                                (max(0, px1 - 15),              max(0, py1 + int(ph * 0.25)),
+                                 min(w, px1 + int(pw * 0.30)),  min(h, py1 + int(ph * 0.75))),
+                                # Right arm strip
+                                (max(0, px1 + int(pw * 0.70)),  max(0, py1 + int(ph * 0.25)),
+                                 min(w, px2 + 15),              min(h, py1 + int(ph * 0.75))),
+                                # Left reach (reaching toward machine)
+                                (max(0, px1 - 15),              max(0, py1 + int(ph * 0.40)),
+                                 min(w, px1 + int(pw * 0.45)),  min(h, py1 + int(ph * 0.85))),
+                                # Right reach
+                                (max(0, px1 + int(pw * 0.55)),  max(0, py1 + int(ph * 0.40)),
+                                 min(w, px2 + 15),              min(h, py1 + int(ph * 0.85))),
                             ]
 
-                            for (zx1, zy1, zx2, zy2) in hand_zones:
-                                if gear_states['glove'] == 'present':
-                                    break  # Already confirmed — no need to check more zones
+                            glove_votes = 0   # zones that see a glove
+                            no_glove_votes = 0  # zones that see bare skin
+                            best_glove_box = None
+                            best_glove_conf = 0.0
+                            best_no_glove_box = None
+                            best_no_glove_conf = 0.0
+
+                            for (zx1, zy1, zx2, zy2) in arm_zones:
                                 zone_crop = frame[zy1:zy2, zx1:zx2]
                                 if zone_crop.size == 0:
                                     continue
 
-                                # Step 1: Color-based dark/black glove detector
-                                has_dark_glove, gbox = detect_dark_gloves(zone_crop)
-                                if has_dark_glove and gbox:
-                                    gear_states['glove'] = 'present'
-                                    ggx1 = zx1 + gbox[0]
-                                    ggy1 = zy1 + gbox[1]
-                                    ggx2 = zx1 + gbox[2]
-                                    ggy2 = zy1 + gbox[3]
-                                    worker_items.append(([ggx1, ggy1, ggx2, ggy2], "glove", 0.88))
-                                    break
-
-                                # Step 2: YOLO on the hand zone (higher conf to avoid false no-glove)
-                                a_res = ppe_model.predict(zone_crop, conf=0.12, imgsz=192, verbose=False, device='cpu')
+                                # Step 1: YOLO on the narrow arm zone
+                                a_res = ppe_model.predict(
+                                    zone_crop, conf=0.12, imgsz=192, verbose=False, device='cpu')
                                 if a_res and len(a_res) > 0:
                                     for abox in a_res[0].boxes:
                                         acls   = int(abox.cls[0].item())
                                         alabel = PPE_CLASSES.get(acls, '')
                                         aconf  = float(abox.conf[0].item())
                                         acx1, acy1, acx2, acy2 = map(int, abox.xyxy[0].tolist())
-                                        global_box = [zx1 + acx1, zy1 + acy1, zx1 + acx2, zy1 + acy2]
+                                        gb = [zx1 + acx1, zy1 + acy1, zx1 + acx2, zy1 + acy2]
 
-                                        if alabel == 'glove':
-                                            gear_states['glove'] = 'present'
-                                            worker_items.append((global_box, "glove", aconf))
-                                            break
-                                        elif alabel == 'no_glove' and gear_states['glove'] != 'present':
-                                            # Only trust no_glove if confidence >= 0.30
-                                            # Low confidence (e.g. 0.13) often means dark clothing, not bare hands
-                                            if aconf >= 0.30:
-                                                gear_states['glove'] = 'absent'
-                                                worker_items.append((global_box, "no_glove", aconf))
+                                        if alabel == 'glove' and aconf >= 0.25:
+                                            glove_votes += 1
+                                            if aconf > best_glove_conf:
+                                                best_glove_conf = aconf
+                                                best_glove_box = gb
+                                        elif alabel == 'no_glove' and aconf >= 0.35:
+                                            no_glove_votes += 1
+                                            if aconf > best_no_glove_conf:
+                                                best_no_glove_conf = aconf
+                                                best_no_glove_box = gb
+
+                                # Step 2: Skin-exposure check — bare skin in arm zone = no glove
+                                has_skin, skin_ratio = detect_bare_hands_in_zone(zone_crop)
+                                if has_skin:
+                                    no_glove_votes += 1
+
+                            # Decision: glove wins if any zone sees it and outweighs bare-skin votes
+                            if glove_votes > 0 and glove_votes >= no_glove_votes:
+                                gear_states['glove'] = 'present'
+                                if best_glove_box:
+                                    worker_items.append((best_glove_box, "glove", best_glove_conf))
+                            elif no_glove_votes > 0 and no_glove_votes > glove_votes:
+                                gear_states['glove'] = 'absent'
+                                if best_no_glove_box:
+                                    worker_items.append((best_no_glove_box, "no_glove", best_no_glove_conf))
+                            # else: stays 'unknown' — insufficient evidence, not flagged as violation
 
                             WORKER_GEAR_CACHE[track_id] = (gear_states, worker_items)
                         else:
