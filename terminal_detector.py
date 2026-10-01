@@ -441,7 +441,9 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
     print(f"{CYAN}------------------------------------------------------------------------{RESET}\n")
 
     if stride is None:
-        stride = 1 if is_live else 2
+        # Live RTSP: stride 2 (process every other frame) for higher FPS.
+        # Video file: stride 3 for review speed.
+        stride = 2 if is_live else 3
 
     # Warm up models on CPU to eliminate initial inference lag
     dummy = np.zeros((576, 1024, 3), dtype=np.uint8)
@@ -509,29 +511,23 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
 
                 h, w = frame.shape[:2]
 
-                # 1. Global Multi-Person Tracking with ByteTrack at 512px
+                # 1. Multi-Person Tracking with ByteTrack
+                # Low conf (0.08) to catch partially visible / distant workers.
+                # imgsz=640 gives the tracker enough resolution to find all people.
                 track_results = person_model.track(
                     frame,
                     persist=True,
                     classes=[0],
-                    conf=conf_threshold,
-                    imgsz=512,
+                    conf=0.08,
+                    imgsz=640,
                     tracker=tracker,
                     verbose=False,
                     device='cpu'
                 )
 
-                # 2. Global PPE Inference at 512px (cached every 2 frames to save CPU)
-                if frame_count % 2 == 0 or len(last_global_detections) == 0:
-                    ppe_results = ppe_model.predict(frame, conf=0.14, imgsz=512, verbose=False, device='cpu')
-                    last_global_detections = []
-                    if ppe_results and len(ppe_results) > 0:
-                        for box in ppe_results[0].boxes:
-                            cls_id = int(box.cls[0].item())
-                            conf = float(box.conf[0].item())
-                            xyxy = list(map(int, box.xyxy[0].tolist()))
-                            last_global_detections.append((xyxy, cls_id, conf))
-                global_detections = last_global_detections
+                # Skip full-frame global PPE inference — per-worker crops handle
+                # this with better accuracy and much less CPU cost.
+                global_detections = []
 
                 current_workers_status = []
                 frame_violations = 0
@@ -557,46 +553,22 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
 
                         if should_reinspect:
                             gear_states = {
-                                'helmet': 'absent',
+                                'helmet': 'unknown',
                                 'mask': 'absent',
                                 'glove': 'unknown',
                                 'shoes': 'unknown'
                             }
-                            worker_items = []
+                            worker_items = []   # Only mask + glove items stored for display
 
-                            # A. Match Global PPE Items
-                            for (box_ppe, cls_id, conf) in global_detections:
-                                if overlaps(box_ppe, box, threshold=0.10) > 0.10:
-                                    label = PPE_CLASSES.get(cls_id, '')
-                                    if not label:
-                                        continue
-                                    worker_items.append((box_ppe, label, conf))
-                                    
-                                    if label == 'mask':
-                                        gear_states['mask'] = 'present'
-                                    elif label == 'no_mask':
-                                        gear_states['mask'] = 'absent'
-                                    elif label == 'glove':
-                                        gear_states['glove'] = 'present'
-                                    elif label == 'no_glove':
-                                        gear_states['glove'] = 'absent'
-                                    elif label == 'shoes':
-                                        gear_states['shoes'] = 'present'
-                                    elif label == 'no_shoes':
-                                        gear_states['shoes'] = 'absent'
-                                    elif label == 'helmet':
-                                        gear_states['helmet'] = 'present'
-                                    elif label == 'no_helmet':
-                                        gear_states['helmet'] = 'absent'
-
-                            # B. High-Precision Head Crop Inspection (Respirator / Mask)
+                            # B. High-Precision Head Crop — Respirator / N95 / Surgical Mask
+                            # Use 60% of box height (upper portion) as head region
                             hy1 = max(0, py1 - 5)
-                            hy2 = min(h, py1 + int(ph * 0.45))
-                            hx1 = max(0, px1 - 10)
-                            hx2 = min(w, px2 + 10)
+                            hy2 = min(h, py1 + int(ph * 0.50))
+                            hx1 = max(0, px1 - 12)
+                            hx2 = min(w, px2 + 12)
                             head_crop = frame[hy1:hy2, hx1:hx2]
 
-                            # Check 1: Industrial Dual-Cartridge Respirators (Yellow or Pink cartridges)
+                            # Check 1: Industrial Dual-Cartridge Respirators (Yellow / Pink)
                             if head_crop.size > 0:
                                 has_resp, rbox, rtype = detect_industrial_respirator(head_crop)
                                 if has_resp and rbox:
@@ -605,11 +577,13 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
                                     gy1 = hy1 + rbox[1]
                                     gx2 = hx1 + rbox[2]
                                     gy2 = hy1 + rbox[3]
-                                    worker_items.append(([gx1, gy1, gx2, gy2], "respirator", 0.96))
+                                    # Store as unified 'mask' label to avoid double boxes
+                                    worker_items.append(([gx1, gy1, gx2, gy2], "mask", 0.96))
 
-                            # Check 2: Zoomed Model Prediction for N95 / Surgical Mask / Bare Face
+                            # Check 2: YOLO head-crop for N95 / surgical / no-mask
+                            # Only run if respirator check didn't already confirm mask
                             if gear_states['mask'] != 'present' and head_crop.size > 0:
-                                h_res = ppe_model.predict(head_crop, conf=0.14, imgsz=192, verbose=False, device='cpu')
+                                h_res = ppe_model.predict(head_crop, conf=0.12, imgsz=160, verbose=False, device='cpu')
                                 if h_res and len(h_res) > 0:
                                     mask_boxes = []
                                     no_mask_boxes = []
@@ -623,31 +597,29 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
                                             mask_boxes.append((global_item_box, "mask", hconf))
                                         elif hlabel == 'no_mask':
                                             no_mask_boxes.append((global_item_box, "no_mask", hconf))
-                                        elif hlabel == 'goggles':
-                                            worker_items.append((global_item_box, "goggles", hconf))
 
                                     if mask_boxes:
                                         best_m = max(mask_boxes, key=lambda x: x[2])
                                         best_nm = max(no_mask_boxes, key=lambda x: x[2]) if no_mask_boxes else None
                                         if best_nm is None or best_m[2] >= best_nm[2]:
                                             gear_states['mask'] = 'present'
-                                            worker_items.append(best_m)
+                                            worker_items.append(best_m)  # labeled 'mask'
                                         else:
                                             gear_states['mask'] = 'absent'
-                                            worker_items.append(best_nm)
+                                            worker_items.append(best_nm)  # labeled 'no_mask'
                                     elif no_mask_boxes:
                                         gear_states['mask'] = 'absent'
                                         worker_items.append(max(no_mask_boxes, key=lambda x: x[2]))
 
-                            # C. High-Precision Hand & Arm Inspection (Gloves / Bare Hands)
-                            ay1 = max(0, py1 + int(ph * 0.20))
-                            ay2 = min(h, py1 + int(ph * 0.90))
-                            ax1 = max(0, px1 - 30)
-                            ax2 = min(w, px2 + 30)
+                            # C. Glove Inspection — body crop (20%-90% of person height)
+                            ay1 = max(0, py1 + int(ph * 0.15))
+                            ay2 = min(h, py1 + int(ph * 0.95))
+                            ax1 = max(0, px1 - 25)
+                            ax2 = min(w, px2 + 25)
                             hands_crop = frame[ay1:ay2, ax1:ax2]
 
                             if hands_crop.size > 0:
-                                a_res = ppe_model.predict(hands_crop, conf=0.14, imgsz=256, verbose=False, device='cpu')
+                                a_res = ppe_model.predict(hands_crop, conf=0.12, imgsz=224, verbose=False, device='cpu')
                                 if a_res and len(a_res) > 0:
                                     for abox in a_res[0].boxes:
                                         acls = int(abox.cls[0].item())
@@ -731,13 +703,33 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
                             miss_text = f"MISSING: {', '.join(w_info['missing'])}"
                             draw_label(frame, miss_text, (px1, py1 + 22), (0, 0, 255), (255, 255, 255), scale=0.55, thickness=2)
 
-                        # Individual item boxes
+                        # Individual item boxes — show ONLY mask/glove related items.
+                        # Respirator and mask are unified under the 'mask' label with a CYAN box.
+                        # No-glove / no-mask shown in RED. All other items (helmet, shoes) hidden.
+                        SHOW_LABELS = {'mask', 'respirator', 'no_mask', 'glove', 'no_glove'}
+                        seen_mask_box = False  # Prevent double mask/respirator box per worker
                         for (item_box, label_name, conf) in w_info['items']:
+                            if label_name not in SHOW_LABELS:
+                                continue
+                            # Unify respirator label as MASK for display
+                            display_label = "MASK" if label_name == 'respirator' else label_name.upper().replace('_', ' ')
+                            # Skip duplicate mask box if we already drew one
+                            if label_name in ('mask', 'respirator'):
+                                if seen_mask_box:
+                                    continue
+                                seen_mask_box = True
                             ix1, iy1, ix2, iy2 = map(int, item_box)
-                            item_color = COLOR_PALETTE.get(label_name, (255, 255, 0))
+                            if label_name in ('mask', 'respirator'):
+                                item_color = (0, 220, 220)  # Bright cyan for present mask
+                                text_c = (0, 0, 0)
+                            elif label_name == 'glove':
+                                item_color = (0, 255, 180)  # Mint green for gloves
+                                text_c = (0, 0, 0)
+                            else:
+                                item_color = (0, 0, 255)    # Red for missing
+                                text_c = (255, 255, 255)
                             cv2.rectangle(frame, (ix1, iy1), (ix2, iy2), item_color, 2)
-                            text_c = (0, 0, 0) if label_name == 'glove' else (255, 255, 255)
-                            draw_label(frame, f"{label_name.upper()} {conf:.2f}", (ix1, iy1 - 4), item_color, text_c, scale=0.45, thickness=1)
+                            draw_label(frame, f"{display_label} {conf:.2f}", (ix1, iy1 - 4), item_color, text_c, scale=0.48, thickness=1)
 
                     # Top stats bar on video window
                     cam_tag = f"CAM: {active_name} | " if active_name else ""
