@@ -73,57 +73,98 @@ def denoise_frame(frame, clahe_clip=1.5):
     enhanced = cv2.merge((l, a, b))
     return cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
 
-def detect_industrial_respirator(head_crop):
+def detect_face_covering(head_crop):
     """
-    INDUSTRY-READY UNIVERSAL RESPIRATOR DETECTOR (Skin-Safe):
-    Detects factory half-face and full-face elastomeric respirators (3M 6000, 6200, 7500 series):
-    1. Yellow/Gold Organic Vapor cartridges (3M 6001/6003) - High Saturation only to reject skin
-    2. Pink/Magenta P100 Particulate cartridges (3M 2091/2097) - Saturated magenta discs
-    Returns: (has_respirator, bounding_box, label_name)
+    UNIVERSAL LOW-RES CCTV FACE COVERING DETECTOR:
+    Detects ALL types of face masks / respirators adapted for dark, noisy CCTV:
+      1. Industrial respirators  - Yellow cartridges (3M 6001/6003)
+      2. Industrial respirators  - Pink/Magenta P100 (3M 2091/2097)
+      3. Surgical masks (PINK)   - Rose/salmon/pink FFP2, KF94, 3-ply pink
+      4. Surgical masks (BLUE)   - Standard blue surgical / procedure masks
+      5. N95 / FFP2 (WHITE/GRAY) - White or light gray moulded respirators
+      6. Medical (GREEN/TEAL)    - Green or teal surgical masks
+    Adapts to low saturation / washed-out colors typical of low-res CCTV.
+    Returns: (has_mask, bounding_box)
     """
     if head_crop is None or head_crop.size == 0:
-        return False, None, ""
-        
+        return False, None
+
     hh, hw = head_crop.shape[:2]
-    # Check lower 70% of head crop (nose bridge down to below chin)
-    y_start = int(hh * 0.25)
-    y_end = int(hh * 0.95)
+
+    # Upscale tiny head crops 2x so colour analysis works on blurry CCTV frames
+    scale = 2 if max(hh, hw) < 80 else 1
+    if scale > 1:
+        head_crop = cv2.resize(head_crop, (hw * scale, hh * scale), interpolation=cv2.INTER_LINEAR)
+        hh, hw = head_crop.shape[:2]
+
+    # Focus strictly on lower face (nose bridge → chin): rows 30%-95%
+    y_start = int(hh * 0.30)
+    y_end   = int(hh * 0.95)
     x_start = int(hw * 0.05)
-    x_end = int(hw * 0.95)
-    
+    x_end   = int(hw * 0.95)
     face_lower = head_crop[y_start:y_end, x_start:x_end]
     if face_lower.size == 0:
-        return False, None, ""
-        
-    hsv = cv2.cvtColor(face_lower, cv2.COLOR_BGR2HSV)
-    
-    # 1. Industrial Yellow (Hue 25-36, Saturation >= 130 to reject all human skin tones)
-    yellow_mask = cv2.inRange(hsv, np.array([25, 130, 100]), np.array([36, 255, 255]))
-    contours_y, _ = cv2.findContours(yellow_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    y_boxes = [cv2.boundingRect(cnt) for cnt in contours_y if cv2.contourArea(cnt) > 150]
-    
-    # 2. Industrial Pink/Magenta P100 (Hue 138-172, Saturation >= 85 to reject lips/reflections)
-    pink_mask = cv2.inRange(hsv, np.array([138, 85, 60]), np.array([172, 255, 255]))
-    contours_p, _ = cv2.findContours(pink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    p_boxes = [cv2.boundingRect(cnt) for cnt in contours_p if cv2.contourArea(cnt) > 120]
-    
-    chosen_boxes = p_boxes if p_boxes else y_boxes
-    if chosen_boxes:
-        min_x = min(b[0] for b in chosen_boxes)
-        min_y = min(b[1] for b in chosen_boxes)
-        max_x = max(b[0] + b[2] for b in chosen_boxes)
-        max_y = max(b[1] + b[3] for b in chosen_boxes)
-        pad_x = max(8, int((max_x - min_x) * 0.15))
-        pad_y = max(8, int((max_y - min_y) * 0.15))
-        box = [
-            x_start + max(0, min_x - pad_x),
-            y_start + max(0, min_y - pad_y),
-            x_start + min(hw, max_x + pad_x),
-            y_start + min(hh, max_y + pad_y)
-        ]
-        return True, box, "respirator"
+        return False, None
 
-    return False, None, ""
+    # Mild blur to reduce CCTV noise before colour thresholding
+    blurred = cv2.GaussianBlur(face_lower, (3, 3), 0)
+    hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+
+    # ----- Colour layers -----
+    # 1. Industrial Yellow cartridges (3M 6001/6003) — high saturation only
+    yellow   = cv2.inRange(hsv, np.array([ 20, 120,  90]), np.array([ 38, 255, 255]))
+
+    # 2. Industrial Pink/Magenta P100 cartridges — high saturation
+    pink_crt = cv2.inRange(hsv, np.array([135,  80,  60]), np.array([175, 255, 255]))
+
+    # 3. PINK / ROSE surgical masks (salmon, baby pink, hot pink)
+    #    Hue wraps near 0 & 180, lower saturation threshold for washed-out CCTV
+    pink_lo  = cv2.inRange(hsv, np.array([  0,  18, 110]), np.array([ 12, 140, 255]))
+    pink_hi  = cv2.inRange(hsv, np.array([158,  18, 110]), np.array([179, 140, 255]))
+    pink_surg = cv2.bitwise_or(pink_lo, pink_hi)
+
+    # 4. BLUE surgical masks — standard procedure / 3-ply masks
+    blue     = cv2.inRange(hsv, np.array([ 88,  35,  55]), np.array([135, 255, 255]))
+
+    # 5. WHITE / LIGHT GRAY N95, KN95, FFP2 — very low saturation
+    white_n95 = cv2.inRange(hsv, np.array([  0,   0, 150]), np.array([179,  38, 255]))
+
+    # 6. GREEN / TEAL medical masks
+    green    = cv2.inRange(hsv, np.array([ 38,  35,  55]), np.array([ 88, 220, 255]))
+
+    # Combine all layers
+    combined = yellow
+    for layer in (pink_crt, pink_surg, blue, white_n95, green):
+        combined = cv2.bitwise_or(combined, layer)
+
+    # Morphological close to merge nearby mask pixels across noise gaps
+    ksize = 7 if scale > 1 else 5
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
+    combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN,  cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+
+    contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Minimum pixel area — smaller for upscaled low-res crops; large enough to reject noise
+    min_area = 60 * (scale ** 2)
+    valid = [cv2.boundingRect(c) for c in contours if cv2.contourArea(c) > min_area]
+
+    if valid:
+        min_x = min(b[0] for b in valid)
+        min_y = min(b[1] for b in valid)
+        max_x = max(b[0] + b[2] for b in valid)
+        max_y = max(b[1] + b[3] for b in valid)
+        pad = 6 // scale
+        box = [
+            (x_start + max(0, min_x - pad)) // scale,
+            (y_start + max(0, min_y - pad)) // scale,
+            (x_start + min(face_lower.shape[1], max_x + pad)) // scale,
+            (y_start + min(face_lower.shape[0], max_y + pad)) // scale,
+        ]
+        return True, box
+
+    return False, None
+
 
 def overlaps(box1, box2, threshold=0.10):
     x1_1, y1_1, x2_1, y2_1 = box1
@@ -560,30 +601,31 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
                             }
                             worker_items = []   # Only mask + glove items stored for display
 
-                            # B. High-Precision Head Crop — Respirator / N95 / Surgical Mask
-                            # Use 60% of box height (upper portion) as head region
-                            hy1 = max(0, py1 - 5)
-                            hy2 = min(h, py1 + int(ph * 0.50))
-                            hx1 = max(0, px1 - 12)
-                            hx2 = min(w, px2 + 12)
+                            # B. Head Crop: Universal face covering detector (all mask types)
+                            # Extend to 55% of person height to catch overhead-angle view
+                            hy1 = max(0, py1 - 8)
+                            hy2 = min(h, py1 + int(ph * 0.55))
+                            hx1 = max(0, px1 - 15)
+                            hx2 = min(w, px2 + 15)
                             head_crop = frame[hy1:hy2, hx1:hx2]
 
-                            # Check 1: Industrial Dual-Cartridge Respirators (Yellow / Pink)
+                            # Check 1: Color-based universal mask detector (pink, blue, white, green, yellow, cartridge)
                             if head_crop.size > 0:
-                                has_resp, rbox, rtype = detect_industrial_respirator(head_crop)
-                                if has_resp and rbox:
+                                has_mask_color, mbox = detect_face_covering(head_crop)
+                                if has_mask_color and mbox:
                                     gear_states['mask'] = 'present'
-                                    gx1 = hx1 + rbox[0]
-                                    gy1 = hy1 + rbox[1]
-                                    gx2 = hx1 + rbox[2]
-                                    gy2 = hy1 + rbox[3]
+                                    gx1 = hx1 + mbox[0]
+                                    gy1 = hy1 + mbox[1]
+                                    gx2 = hx1 + mbox[2]
+                                    gy2 = hy1 + mbox[3]
                                     # Store as unified 'mask' label to avoid double boxes
-                                    worker_items.append(([gx1, gy1, gx2, gy2], "mask", 0.96))
+                                    worker_items.append(([gx1, gy1, gx2, gy2], "mask", 0.90))
 
                             # Check 2: YOLO head-crop for N95 / surgical / no-mask
-                            # Only run if respirator check didn't already confirm mask
+                            # Only run if color check didn't already confirm mask.
+                            # Low conf 0.08 to catch barely-visible masks in low-res CCTV.
                             if gear_states['mask'] != 'present' and head_crop.size > 0:
-                                h_res = ppe_model.predict(head_crop, conf=0.12, imgsz=160, verbose=False, device='cpu')
+                                h_res = ppe_model.predict(head_crop, conf=0.08, imgsz=160, verbose=False, device='cpu')
                                 if h_res and len(h_res) > 0:
                                     mask_boxes = []
                                     no_mask_boxes = []
