@@ -166,6 +166,72 @@ def detect_face_covering(head_crop):
     return False, None
 
 
+def detect_dark_gloves(hand_crop):
+    """
+    COLOR-BASED DARK/BLACK GLOVE DETECTOR for low-res CCTV:
+    Detects: black, dark navy, dark green work gloves.
+    Focuses strictly on the hand/palm region of the crop.
+    Returns: (has_glove, bounding_box)
+    """
+    if hand_crop is None or hand_crop.size == 0:
+        return False, None
+
+    hh, hw = hand_crop.shape[:2]
+
+    # 2x upscale for tiny hand crops from distant CCTV cameras
+    scale = 2 if max(hh, hw) < 70 else 1
+    if scale > 1:
+        hand_crop = cv2.resize(hand_crop, (hw * scale, hh * scale), interpolation=cv2.INTER_LINEAR)
+        hh, hw = hand_crop.shape[:2]
+
+    blurred = cv2.GaussianBlur(hand_crop, (3, 3), 0)
+    hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+
+    # Black / very dark work gloves (any hue, low value)
+    black    = cv2.inRange(hsv, np.array([  0,   0,   0]), np.array([179, 255,  60]))
+
+    # Dark navy / dark blue gloves
+    dk_blue  = cv2.inRange(hsv, np.array([ 90,  40,  20]), np.array([130, 255,  90]))
+
+    # Dark green rubber gloves
+    dk_green = cv2.inRange(hsv, np.array([ 38,  40,  20]), np.array([ 88, 255,  90]))
+
+    # Yellow / orange hi-vis gloves
+    hiviz    = cv2.inRange(hsv, np.array([ 15, 120,  80]), np.array([ 38, 255, 255]))
+
+    # White / light gray latex gloves
+    white_gl = cv2.inRange(hsv, np.array([  0,   0, 160]), np.array([179,  40, 255]))
+
+    combined = black
+    for layer in (dk_blue, dk_green, hiviz, white_gl):
+        combined = cv2.bitwise_or(combined, layer)
+
+    # Morphological close to fill gaps from compression artifacts
+    ksize = 7 if scale > 1 else 5
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
+    combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN,
+                                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+
+    contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    min_area = 70 * (scale ** 2)
+    valid = [cv2.boundingRect(c) for c in contours if cv2.contourArea(c) > min_area]
+
+    if valid:
+        # Use the largest contiguous region
+        bx, by, bw, bh = max(valid, key=lambda b: b[2] * b[3])
+        pad = 4 // scale
+        box = [
+            max(0, bx - pad) // scale,
+            max(0, by - pad) // scale,
+            min(hw, bx + bw + pad) // scale,
+            min(hh, by + bh + pad) // scale,
+        ]
+        return True, box
+
+    return False, None
+
+
 def overlaps(box1, box2, threshold=0.10):
     x1_1, y1_1, x2_1, y2_1 = box1
     x1_2, y1_2, x2_2, y2_2 = box2
@@ -653,28 +719,63 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
                                         gear_states['mask'] = 'absent'
                                         worker_items.append(max(no_mask_boxes, key=lambda x: x[2]))
 
-                            # C. Glove Inspection — body crop (20%-90% of person height)
-                            ay1 = max(0, py1 + int(ph * 0.15))
-                            ay2 = min(h, py1 + int(ph * 0.95))
-                            ax1 = max(0, px1 - 25)
-                            ax2 = min(w, px2 + 25)
-                            hands_crop = frame[ay1:ay2, ax1:ax2]
+                            # C. Glove Inspection — focused PALM zones only
+                            # Three crops: left hand, right hand, bottom-center.
+                            # This avoids the full-body crop that mis-reads dark clothing as no-glove.
+                            pw = max(1, px2 - px1)
+                            hand_zone_y1 = max(0, py1 + int(ph * 0.55))
+                            hand_zone_y2 = min(h, py2 + 10)
 
-                            if hands_crop.size > 0:
-                                a_res = ppe_model.predict(hands_crop, conf=0.12, imgsz=224, verbose=False, device='cpu')
+                            hand_zones = [
+                                # Left hand / wrist area
+                                (max(0, px1 - 20), hand_zone_y1,
+                                 min(w, px1 + int(pw * 0.50)), hand_zone_y2),
+                                # Right hand / wrist area
+                                (max(0, px1 + int(pw * 0.50)), hand_zone_y1,
+                                 min(w, px2 + 20), hand_zone_y2),
+                                # Bottom-center (hands reaching forward at a machine)
+                                (max(0, px1 + int(pw * 0.10)), max(0, py1 + int(ph * 0.70)),
+                                 min(w, px2 - int(pw * 0.10)), hand_zone_y2),
+                            ]
+
+                            for (zx1, zy1, zx2, zy2) in hand_zones:
+                                if gear_states['glove'] == 'present':
+                                    break  # Already confirmed — no need to check more zones
+                                zone_crop = frame[zy1:zy2, zx1:zx2]
+                                if zone_crop.size == 0:
+                                    continue
+
+                                # Step 1: Color-based dark/black glove detector
+                                has_dark_glove, gbox = detect_dark_gloves(zone_crop)
+                                if has_dark_glove and gbox:
+                                    gear_states['glove'] = 'present'
+                                    ggx1 = zx1 + gbox[0]
+                                    ggy1 = zy1 + gbox[1]
+                                    ggx2 = zx1 + gbox[2]
+                                    ggy2 = zy1 + gbox[3]
+                                    worker_items.append(([ggx1, ggy1, ggx2, ggy2], "glove", 0.88))
+                                    break
+
+                                # Step 2: YOLO on the hand zone (higher conf to avoid false no-glove)
+                                a_res = ppe_model.predict(zone_crop, conf=0.12, imgsz=192, verbose=False, device='cpu')
                                 if a_res and len(a_res) > 0:
                                     for abox in a_res[0].boxes:
-                                        acls = int(abox.cls[0].item())
+                                        acls   = int(abox.cls[0].item())
                                         alabel = PPE_CLASSES.get(acls, '')
-                                        aconf = float(abox.conf[0].item())
+                                        aconf  = float(abox.conf[0].item())
+                                        acx1, acy1, acx2, acy2 = map(int, abox.xyxy[0].tolist())
+                                        global_box = [zx1 + acx1, zy1 + acy1, zx1 + acx2, zy1 + acy2]
+
                                         if alabel == 'glove':
                                             gear_states['glove'] = 'present'
-                                            acx1, acy1, acx2, acy2 = map(int, abox.xyxy[0].tolist())
-                                            worker_items.append(([ax1 + acx1, ay1 + acy1, ax1 + acx2, ay1 + acy2], "glove", aconf))
+                                            worker_items.append((global_box, "glove", aconf))
+                                            break
                                         elif alabel == 'no_glove' and gear_states['glove'] != 'present':
-                                            gear_states['glove'] = 'absent'
-                                            acx1, acy1, acx2, acy2 = map(int, abox.xyxy[0].tolist())
-                                            worker_items.append(([ax1 + acx1, ay1 + acy1, ax1 + acx2, ay1 + acy2], "no_glove", aconf))
+                                            # Only trust no_glove if confidence >= 0.30
+                                            # Low confidence (e.g. 0.13) often means dark clothing, not bare hands
+                                            if aconf >= 0.30:
+                                                gear_states['glove'] = 'absent'
+                                                worker_items.append((global_box, "no_glove", aconf))
 
                             WORKER_GEAR_CACHE[track_id] = (gear_states, worker_items)
                         else:
