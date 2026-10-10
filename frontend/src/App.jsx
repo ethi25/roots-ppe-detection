@@ -3,289 +3,406 @@ import React, { useState, useEffect, useRef } from 'react';
 const API_BASE = 'http://127.0.0.1:8000';
 
 function App() {
-  const [status, setStatus] = useState({ task: 'idle', progress: 0, message: 'System Idle', logs: [] });
-  const [viewMode, setViewMode] = useState('live'); // 'live' or 'rendered'
-  const [processedVideoUrl, setProcessedVideoUrl] = useState('');
-  
-  // Selection and Upload state
-  const [selectedVideo, setSelectedVideo] = useState('E:\\New folder (2)\\CCTV 1.mp4');
-  const [uploadedVideoPath, setUploadedVideoPath] = useState('');
-  const [uploading, setUploading] = useState(false);
-  const [demoMode, setDemoMode] = useState(true);
-  
-  const videoPlayerRef = useRef(null);
+  const [activeCam, setActiveCam] = useState('d29');
+  const [stats, setStats] = useState({
+    camera_name: '[D29] POWDER COATING OFFICE AREA',
+    active_workers: 0,
+    compliant_workers: 0,
+    violating_workers: 0,
+    compliance_rate: 100,
+    fps: 0,
+    device_name: 'NVIDIA RTX 4050 GPU',
+    recent_events: []
+  });
+  const [isPlaying, setIsPlaying] = useState(true);
+  const [audioAlert, setAudioAlert] = useState(false);
+  const [cameras, setCameras] = useState([
+    { id: 'd29', name: '[D29] Powder Coating Office Area' },
+    { id: 'd3', name: '[D3] PC Spray Booth West Wall' },
+    { id: 'd23', name: '[D23] Tool Room' },
+    { id: 'webcam', name: 'Live Webcam' },
+    { id: 'demo', name: 'Demo Footage' },
+  ]);
+  const [streamUrl, setStreamUrl] = useState(`${API_BASE}/api/cctv-stream?camera=d29&t=${Date.now()}`);
+  const [isStreamLoading, setIsStreamLoading] = useState(true);
+  const [streamError, setStreamError] = useState(false);
 
-  // Poll status from FastAPI
+  const videoContainerRef = useRef(null);
+  const lastEventKeyRef = useRef('');
+
+  // Switch camera feed
+  const switchCamera = (camId) => {
+    setActiveCam(camId);
+    setIsStreamLoading(true);
+    setStreamError(false);
+    setStreamUrl(`${API_BASE}/api/cctv-stream?camera=${camId}&t=${Date.now()}`);
+  };
+
+  // Poll live stats every 1 second
   useEffect(() => {
-    const fetchStatus = async () => {
+    let isMounted = true;
+    const fetchStats = async () => {
       try {
-        const res = await fetch(`${API_BASE}/api/status`);
-        const data = await res.json();
-        setStatus(data);
+        const res = await fetch(`${API_BASE}/api/live-stats`);
+        if (res.ok && isMounted) {
+          const data = await res.json();
+          setStats(data);
 
-        if (data.task === 'idle' && data.progress === 100 && data.message.includes('successfully')) {
-          fetchLatestProcessedVideo();
+          // Audio chime on new violation if enabled
+          if (audioAlert && data.recent_events && data.recent_events.length > 0) {
+            const latest = data.recent_events[0];
+            if (latest.key !== lastEventKeyRef.current) {
+              lastEventKeyRef.current = latest.key;
+              playAlertSound();
+            }
+          }
         }
       } catch (err) {
-        console.error('Error fetching status:', err);
+        // Server initializing
       }
     };
 
-    fetchStatus();
-    const interval = setInterval(fetchStatus, 1500);
-    return () => clearInterval(interval);
-  }, []);
+    fetchStats();
+    const interval = setInterval(fetchStats, 1000);
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+    };
+  }, [audioAlert]);
 
-  const fetchLatestProcessedVideo = async () => {
+  // Audio tone generator
+  const playAlertSound = () => {
     try {
-      const res = await fetch(`${API_BASE}/api/processed-videos`);
-      const videos = await res.json();
-      if (videos && videos.length > 0) {
-        setProcessedVideoUrl(`${API_BASE}${videos[0]}?t=${Date.now()}`);
-      }
-    } catch (err) {
-      console.error('Error fetching processed video:', err);
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(587.33, ctx.currentTime); // D5
+      gain.gain.setValueAtTime(0.15, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.35);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.35);
+    } catch (e) {
+      // AudioContext policy
     }
   };
 
-  useEffect(() => {
-    fetchLatestProcessedVideo();
-  }, []);
+  // Take Snapshot
+  const handleSnapshot = () => {
+    const link = document.createElement('a');
+    link.href = `${API_BASE}/api/snapshot?t=${Date.now()}`;
+    link.download = `ppe_snapshot_${Date.now()}.jpg`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
 
-  // Handle Upload
-  const handleUpload = async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-
-    setUploading(true);
-    const formData = new FormData();
-    formData.append('file', file);
-
-    try {
-      const res = await fetch(`${API_BASE}/api/upload`, {
-        method: 'POST',
-        body: formData,
-      });
-      const data = await res.json();
-      setUploadedVideoPath(data.video_path);
-      setSelectedVideo(data.video_path);
-      setViewMode('live');
-      alert(`Video uploaded successfully! Click '▶ Stream Live PPE Detection' to view live bounding boxes immediately.`);
-    } catch (err) {
-      alert('Upload failed: ' + err.message);
-    } finally {
-      setUploading(false);
+  // Toggle Fullscreen
+  const toggleFullscreen = () => {
+    if (!videoContainerRef.current) return;
+    if (!document.fullscreenElement) {
+      videoContainerRef.current.requestFullscreen().catch(() => {});
+    } else {
+      document.exitFullscreen().catch(() => {});
     }
   };
 
-  // Trigger Off-line Detection & Video Saving
-  const startInference = async () => {
-    setViewMode('rendered');
-    setProcessedVideoUrl('');
-    try {
-      const res = await fetch(`${API_BASE}/api/process-video`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          video_path: selectedVideo,
-          strict_mode: true,
-          alert_threshold_frames: 5,
-          max_frames: demoMode ? 500 : 0,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        alert(data.detail);
-      }
-    } catch (err) {
-      alert('Request failed: ' + err.message);
-    }
+  // Calculate compliance color
+  const getComplianceColor = (rate) => {
+    if (rate >= 90) return 'var(--color-success)';
+    if (rate >= 50) return 'var(--color-warning)';
+    return 'var(--color-danger)';
   };
-
-  const getFileName = (path) => {
-    if (!path) return '';
-    return path.split('/').pop().split('\\').pop();
-  };
-
-  const liveFeedUrl = `${API_BASE}/api/video-feed?video_path=${encodeURIComponent(selectedVideo)}`;
 
   return (
-    <div className="app-container" style={{ padding: '30px 50px', background: '#0b0f17', minHeight: '100vh' }}>
-      
-      {/* Header Banner */}
-      <header style={{
-        marginBottom: '24px',
-        padding: '18px 28px',
-        background: 'rgba(17, 24, 39, 0.7)',
-        borderRadius: '16px',
-        border: '1px solid var(--border-color)',
-        display: 'flex',
-        justifyContent: 'space-between',
-        alignItems: 'center',
-        backdropFilter: 'blur(10px)'
-      }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '15px' }}>
-          <span style={{ fontSize: '2.2rem' }}>🛡️</span>
+    <div className="app-container">
+      {/* 1. Clean App Header */}
+      <header className="app-header">
+        <div className="brand-section">
+          <div className="brand-icon">🛡️</div>
           <div>
-            <h1 style={{ fontSize: '1.7rem', color: '#fff', margin: 0 }}>PPE Detection & Bounding Box System</h1>
-            <p style={{ fontSize: '0.85rem', color: 'var(--color-text-muted)', marginTop: '4px' }}>
-              Upload any CCTV video to detect employees, helmets, masks, gloves, and safety shoes in real-time.
+            <h1 className="brand-title">ROOTS PPE Compliance Monitor</h1>
+            <p className="brand-subtitle">
+              Live Factory Industrial Safety & Protective Equipment Detection
             </p>
           </div>
         </div>
 
-        <div>
-          {status.task !== 'idle' ? (
-            <div className="badge badge-warning" style={{ padding: '10px 18px', fontSize: '0.88rem' }}>
-              ⚡ Processing ({status.progress}%)
-            </div>
-          ) : (
-            <div className="badge badge-success" style={{ padding: '10px 18px', fontSize: '0.88rem' }}>
-              System Ready
-            </div>
-          )}
+        <div className="header-actions">
+          <span className="pill-badge live">
+            <span className="live-dot"></span>
+            Live Detection
+          </span>
+          <span className="pill-badge" style={{ background: '#f1f5f9', color: '#475569', border: '1px solid #cbd5e1' }}>
+            ⚡ {stats.device_name || 'RTX 4050 GPU'}
+          </span>
         </div>
       </header>
 
-      {/* Upload & Controls */}
-      <div className="glass-card" style={{ marginBottom: '24px' }}>
-        <h3 style={{ marginBottom: '14px', color: '#fff' }}>1. Select or Upload CCTV Video</h3>
-        <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr 1fr', gap: '15px', alignItems: 'end' }}>
-          
-          <div>
-            <label className="form-label">Video Source</label>
-            <select 
-              value={selectedVideo} 
-              onChange={(e) => {
-                setSelectedVideo(e.target.value);
-                setViewMode('live');
-              }} 
-              className="form-input"
-            >
-              <option value="E:\New folder (2)\CCTV 1.mp4">CCTV 1.mp4 (Sample Factory CCTV)</option>
-              {uploadedVideoPath && (
-                <option value={uploadedVideoPath}>Uploaded: {getFileName(uploadedVideoPath)}</option>
-              )}
-            </select>
+      {/* 2. Top Metrics Overview Cards */}
+      <div className="metrics-grid">
+        <div className="metric-card">
+          <div className="metric-header">
+            <span className="metric-title">Compliance Rate</span>
+            <span className="metric-icon">📊</span>
           </div>
-
-          <div>
-            <label className="form-label">Upload Video</label>
-            <input 
-              type="file" 
-              accept="video/*" 
-              onChange={handleUpload} 
-              style={{ display: 'none' }} 
-              id="video-upload-input"
-            />
-            <label htmlFor="video-upload-input" className="btn-secondary" style={{ width: '100%', justifyContent: 'center', cursor: 'pointer' }}>
-              {uploading ? 'Uploading...' : '📁 Choose File'}
-            </label>
+          <div className="metric-value" style={{ color: getComplianceColor(stats.compliance_rate) }}>
+            {stats.compliance_rate}%
           </div>
-
-          <div>
-            <button 
-              onClick={() => setViewMode('live')} 
-              className="btn-secondary"
-              style={{ 
-                width: '100%', 
-                height: '45px', 
-                justifyContent: 'center', 
-                background: viewMode === 'live' ? 'rgba(59, 130, 246, 0.2)' : 'rgba(255,255,255,0.03)',
-                borderColor: viewMode === 'live' ? 'var(--color-primary)' : 'var(--border-color)',
-                color: '#fff',
-                fontWeight: 'bold'
-              }}
-            >
-              ▶ Stream Live Detection
-            </button>
+          <div className="metric-sub">
+            {stats.compliant_workers} of {Math.max(stats.active_workers, 1)} workers compliant
           </div>
-
-          <div>
-            <button 
-              onClick={startInference} 
-              disabled={status.task !== 'idle' || uploading} 
-              className="btn-primary"
-              style={{ width: '100%', height: '45px', justifyContent: 'center' }}
-            >
-              {status.task === 'process_video' ? `Rendering (${status.progress}%)` : '🎬 Render & Save MP4'}
-            </button>
-          </div>
-
         </div>
 
-        <div style={{ marginTop: '14px', display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <input 
-            type="checkbox" 
-            id="demo-mode"
-            checked={demoMode} 
-            onChange={(e) => setDemoMode(e.target.checked)} 
-          />
-          <label htmlFor="demo-mode" style={{ fontSize: '0.85rem', color: 'var(--color-warning)', cursor: 'pointer', fontWeight: 500 }}>
-            Fast Demo Mode (Render first 500 frames) — Uncheck for full-length MP4 file save
-          </label>
+        <div className="metric-card">
+          <div className="metric-header">
+            <span className="metric-title">Workers Monitored</span>
+            <span className="metric-icon">👥</span>
+          </div>
+          <div className="metric-value">
+            {stats.active_workers}
+          </div>
+          <div className="metric-sub">
+            Tracked in current camera zone
+          </div>
         </div>
 
-        {status.task === 'process_video' && (
-          <div style={{ marginTop: '16px', background: 'rgba(0,0,0,0.3)', padding: '12px', borderRadius: '10px', border: '1px solid var(--border-color)' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.85rem', marginBottom: '6px' }}>
-              <span style={{ color: 'var(--color-primary)' }}>{status.message}</span>
-              <span>{status.progress}%</span>
-            </div>
-            <div style={{ background: 'rgba(255,255,255,0.05)', height: '8px', borderRadius: '4px', overflow: 'hidden' }}>
-              <div style={{ width: `${status.progress}%`, background: 'var(--color-primary)', height: '100%', transition: 'width 0.3s' }}></div>
-            </div>
+        <div className="metric-card">
+          <div className="metric-header">
+            <span className="metric-title">Face Protection</span>
+            <span className="metric-icon">😷</span>
           </div>
-        )}
+          <div className="metric-value" style={{ fontSize: '1.25rem', color: '#0284c7' }}>
+            Active
+          </div>
+          <div className="metric-sub">
+            Pink / Blue / White N95 & Respirators
+          </div>
+        </div>
+
+        <div className="metric-card">
+          <div className="metric-header">
+            <span className="metric-title">Hand Protection</span>
+            <span className="metric-icon">🧤</span>
+          </div>
+          <div className="metric-value" style={{ fontSize: '1.25rem', color: '#d97706' }}>
+            Palm Analysis
+          </div>
+          <div className="metric-sub">
+            Protective Gloves vs Bare Skin Palm
+          </div>
+        </div>
+
+        <div className="metric-card">
+          <div className="metric-header">
+            <span className="metric-title">Inference Speed</span>
+            <span className="metric-icon">⚡</span>
+          </div>
+          <div className="metric-value" style={{ color: 'var(--color-primary)' }}>
+            {stats.fps > 0 ? `${stats.fps} FPS` : 'Ready'}
+          </div>
+          <div className="metric-sub">
+            Hardware Accelerated on RTX 4050
+          </div>
+        </div>
       </div>
 
-      {/* Main Stream Display Container */}
-      <div className="glass-card" style={{ padding: '24px' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
-          <div>
-            <h3 style={{ color: '#fff', margin: 0, display: 'inline-block', marginRight: '15px' }}>
-              {viewMode === 'live' ? '⚡ Real-Time Live Detection Stream' : '🎬 Rendered Annotated MP4 Video'}
-            </h3>
-            <span style={{ fontSize: '0.82rem', color: 'var(--color-text-muted)' }}>
-              Source: {getFileName(selectedVideo)}
+      {/* 3. Camera Selector Bar */}
+      <div className="camera-selector-bar">
+        <div className="camera-tabs">
+          <span style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginRight: 6 }}>
+            CCTV Channels:
+          </span>
+          {cameras.map((c) => (
+            <button
+              key={c.id}
+              className={`camera-btn ${activeCam === c.id ? 'active' : ''}`}
+              onClick={() => switchCamera(c.id)}
+            >
+              📹 {c.name}
+            </button>
+          ))}
+        </div>
+
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button
+            className="btn-action"
+            onClick={() => setAudioAlert(!audioAlert)}
+            title="Toggle audio alert chime on violation"
+          >
+            {audioAlert ? '🔔 Sound: ON' : '🔕 Sound: OFF'}
+          </button>
+          <button
+            className="btn-action"
+            onClick={handleSnapshot}
+            title="Save high-resolution snapshot"
+          >
+            📸 Snapshot
+          </button>
+        </div>
+      </div>
+
+      {/* 4. Main Video Stream Display */}
+      <div className="stream-container-card" ref={videoContainerRef}>
+        <div className="stream-card-header">
+          <div className="stream-card-title">
+            <span>🔴 {stats.camera_name || 'Factory CCTV Stream'}</span>
+            <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)', fontWeight: 400 }}>
+              (Fine-tuned YOLOv8m + ByteTrack)
             </span>
           </div>
 
-          <div style={{ display: 'flex', gap: '15px', fontSize: '0.82rem' }}>
-            <span style={{ color: '#10b981', fontWeight: 600 }}>🟩 Green Box = Present Gear / Compliant</span>
-            <span style={{ color: '#ef4444', fontWeight: 600 }}>libre Red Box = Missing Gear / Violation</span>
+          <div className="stream-actions">
+            <button
+              className="btn-action"
+              onClick={() => setIsPlaying(!isPlaying)}
+            >
+              {isPlaying ? '⏸ Pause' : '▶ Resume'}
+            </button>
+            <button
+              className="btn-action"
+              onClick={toggleFullscreen}
+            >
+              ⛶ Fullscreen
+            </button>
           </div>
         </div>
-        
-        <div style={{ background: '#000', borderRadius: '14px', overflow: 'hidden', border: '1px solid var(--border-color)', minHeight: '480px', display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
-          
-          {viewMode === 'live' ? (
-            <img 
-              src={liveFeedUrl} 
-              alt="Real-time live bounding box feed" 
-              style={{ width: '100%', maxHeight: '680px', display: 'block', objectFit: 'contain' }} 
-            />
+
+        <div className="video-frame-wrapper">
+          {isPlaying ? (
+            <>
+              {isStreamLoading && (
+                <div className="stream-loading-badge">
+                  <div className="stream-spinner"></div>
+                  <span>Loading feed...</span>
+                </div>
+              )}
+              {streamError ? (
+                <div style={{ padding: '60px 20px', color: '#ffffff', textAlign: 'center' }}>
+                  <p style={{ fontSize: '1.1rem', marginBottom: '8px', color: '#f87171' }}>
+                    Camera feed temporarily unavailable
+                  </p>
+                  <p style={{ fontSize: '0.85rem', color: '#94a3b8', marginBottom: '16px' }}>
+                    Switch to recorded factory demo footage for testing
+                  </p>
+                  <button
+                    className="btn-action"
+                    style={{ background: 'var(--color-primary)', color: '#ffffff', border: 'none' }}
+                    onClick={() => switchCamera('demo')}
+                  >
+                    ▶ Switch to Demo Footage
+                  </button>
+                </div>
+              ) : (
+                <img
+                  key={streamUrl}
+                  src={streamUrl}
+                  alt="Live PPE Compliance Feed"
+                  className="stream-img"
+                  onLoad={() => {
+                    setIsStreamLoading(false);
+                    setStreamError(false);
+                  }}
+                  onError={() => {
+                    setIsStreamLoading(false);
+                    setStreamError(true);
+                  }}
+                />
+              )}
+            </>
           ) : (
-            processedVideoUrl ? (
-              <video 
-                ref={videoPlayerRef}
-                src={processedVideoUrl} 
-                controls 
-                autoPlay
-                style={{ width: '100%', maxHeight: '680px', display: 'block' }}
-              />
-            ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '480px', color: 'var(--color-text-muted)' }}>
-                <span style={{ fontSize: '2.5rem', marginBottom: '12px' }}>⚙️</span>
-                <p style={{ fontSize: '1.1rem', color: '#fff' }}>Rendering MP4 video with bounding boxes...</p>
-                <p style={{ fontSize: '0.85rem' }}>{status.message} ({status.progress}%)</p>
-              </div>
-            )
+            <div style={{ padding: '80px 20px', color: '#ffffff', textAlign: 'center' }}>
+              <p style={{ fontSize: '1.2rem', marginBottom: '12px' }}>Stream Paused</p>
+              <button
+                className="btn-action"
+                style={{ background: 'var(--color-primary)', color: '#ffffff', border: 'none' }}
+                onClick={() => setIsPlaying(true)}
+              >
+                ▶ Resume Feed
+              </button>
+            </div>
           )}
 
+          <div className="stream-hud-overlay">
+            <span className="hud-pill">{stats.fps} FPS</span>
+            <span className="hud-pill">{stats.active_workers} Workers</span>
+            <span
+              className="hud-pill"
+              style={{
+                background: stats.compliance_rate >= 90 ? 'rgba(16, 185, 129, 0.85)' : 'rgba(239, 68, 68, 0.85)'
+              }}
+            >
+              {stats.compliance_rate}% Compliant
+            </span>
+          </div>
         </div>
       </div>
 
+      {/* 5. Live Activity & Violation Log */}
+      <div className="activity-card">
+        <div className="activity-header">
+          <h2 className="activity-title">Live Safety Activity & Violations Log</h2>
+          <span style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>
+            Real-time feed across monitored zones
+          </span>
+        </div>
+
+        <div className="table-wrapper">
+          {stats.recent_events && stats.recent_events.length > 0 ? (
+            <table className="clean-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Camera Zone</th>
+                  <th>Worker ID</th>
+                  <th>Violation Details</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {stats.recent_events.map((ev, idx) => (
+                  <tr key={idx}>
+                    <td style={{ fontWeight: 600, color: 'var(--text-muted)' }}>{ev.time}</td>
+                    <td>{ev.camera}</td>
+                    <td>
+                      <strong>Worker #{ev.worker_id}</strong>
+                    </td>
+                    <td>
+                      {ev.missing && ev.missing.length > 0 ? (
+                        <span className="tag-violation">
+                          ⚠️ Missing {ev.missing.join(', ')}
+                        </span>
+                      ) : (
+                        <span className="tag-compliant">Compliant</span>
+                      )}
+                    </td>
+                    <td>
+                      <span className="tag-violation">Needs Action</span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <div className="empty-state">
+              <div className="empty-icon">✅</div>
+              <p style={{ fontWeight: 600, color: 'var(--text-main)', marginBottom: 4 }}>
+                All Workers Fully Compliant
+              </p>
+              <p style={{ fontSize: '0.85rem' }}>
+                All detected workers are currently wearing both face protection (masks/respirators) and protective gloves.
+              </p>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* 6. Footer */}
+      <footer className="app-footer">
+        ROOTS Industrial PPE Detection Engine • Powered by Fine-tuned YOLOv8m on NVIDIA RTX 4050 • ByteTrack Multi-Worker Tracking
+      </footer>
     </div>
   );
 }

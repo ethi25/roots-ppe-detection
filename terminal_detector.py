@@ -20,6 +20,24 @@ if hasattr(sys.stdout, 'reconfigure'):
     except Exception:
         pass
 
+def load_env_file():
+    for env_path in [".env", os.path.join(os.path.dirname(__file__), ".env")]:
+        if os.path.exists(env_path):
+            try:
+                with open(env_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            k, v = line.split("=", 1)
+                            k, v = k.strip(), v.strip().strip("'\"")
+                            if k and k not in os.environ:
+                                os.environ[k] = v
+                break
+            except Exception:
+                pass
+
+load_env_file()
+
 CURRENT_CAMERA_NAME = ""
 
 # ANSI Colors for Terminal
@@ -64,6 +82,93 @@ COLOR_PALETTE = {
 }
 
 WORKER_HISTORY = {}
+WORKER_GEAR_MEMORY = {}
+
+class PersistentWorkerRegistry:
+    """
+    Industrial Persistent Worker Registry.
+    Bridges transient ByteTrack IDs (which jump to 126, 127 etc. after brief occlusions)
+    to permanent, human-friendly worker IDs (Worker #1, Worker #2, etc.)
+    using spatial proximity and motion continuity.
+    """
+    def __init__(self, max_idle_time=45.0, max_match_dist_norm=0.20):
+        self.max_idle_time = max_idle_time
+        self.max_match_dist_norm = max_match_dist_norm
+        self.slots = {}
+        self.tid_to_slot = {}
+
+    def update(self, detected_boxes, byte_track_ids, current_time, frame_w, frame_h):
+        dead_slots = [
+            slot for slot, data in self.slots.items()
+            if (current_time - data['last_seen']) > self.max_idle_time
+        ]
+        for slot in dead_slots:
+            del self.slots[slot]
+            self.tid_to_slot = {t: s for t, s in self.tid_to_slot.items() if s != slot}
+
+        diag = np.sqrt(frame_w**2 + frame_h**2)
+        max_dist_px = self.max_match_dist_norm * diag
+
+        resolved_slots = [None] * len(detected_boxes)
+        unmatched_indices = []
+
+        # 1. Match known ByteTrack IDs first
+        for i, (box, tid) in enumerate(zip(detected_boxes, byte_track_ids)):
+            if tid in self.tid_to_slot and self.tid_to_slot[tid] in self.slots:
+                slot = self.tid_to_slot[tid]
+                cx = (box[0] + box[2]) / 2.0
+                cy = (box[1] + box[3]) / 2.0
+                self.slots[slot]['last_seen'] = current_time
+                self.slots[slot]['box'] = box
+                self.slots[slot]['centroid'] = (cx, cy)
+                self.slots[slot]['last_tid'] = tid
+                resolved_slots[i] = slot
+            else:
+                unmatched_indices.append(i)
+
+        available_slots = [slot for slot in self.slots if slot not in resolved_slots]
+
+        # 2. For newly spawned ByteTrack IDs (e.g. 126), re-identify using nearest idle slot
+        for i in unmatched_indices:
+            box = detected_boxes[i]
+            tid = byte_track_ids[i]
+            cx = (box[0] + box[2]) / 2.0
+            cy = (box[1] + box[3]) / 2.0
+
+            best_slot = None
+            best_dist = float('inf')
+
+            for slot in available_slots:
+                prev_cx, prev_cy = self.slots[slot]['centroid']
+                dist = np.sqrt((cx - prev_cx)**2 + (cy - prev_cy)**2)
+                if dist < max_dist_px and dist < best_dist:
+                    best_dist = dist
+                    best_slot = slot
+
+            if best_slot is not None:
+                self.tid_to_slot[tid] = best_slot
+                self.slots[best_slot]['last_seen'] = current_time
+                self.slots[best_slot]['box'] = box
+                self.slots[best_slot]['centroid'] = (cx, cy)
+                self.slots[best_slot]['last_tid'] = tid
+                resolved_slots[i] = best_slot
+                available_slots.remove(best_slot)
+            else:
+                assigned_slot = 1
+                while assigned_slot in self.slots:
+                    assigned_slot += 1
+                self.slots[assigned_slot] = {
+                    'last_seen': current_time,
+                    'box': box,
+                    'centroid': (cx, cy),
+                    'last_tid': tid
+                }
+                self.tid_to_slot[tid] = assigned_slot
+                resolved_slots[i] = assigned_slot
+
+        return resolved_slots
+
+worker_registry = PersistentWorkerRegistry()
 
 def denoise_frame(frame, clahe_clip=1.5):
     lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
@@ -73,109 +178,81 @@ def denoise_frame(frame, clahe_clip=1.5):
     enhanced = cv2.merge((l, a, b))
     return cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
 
-def detect_face_covering(head_crop):
+def detect_industrial_cartridge_in_lower_face(head_crop):
     """
-    UNIVERSAL LOW-RES CCTV FACE COVERING DETECTOR:
-    Detects ALL types of face masks / respirators adapted for dark, noisy CCTV:
-      1. Industrial respirators  - Yellow cartridges (3M 6001/6003)
-      2. Industrial respirators  - Pink/Magenta P100 (3M 2091/2097)
-      3. Surgical masks (PINK)   - Rose/salmon/pink FFP2, KF94, 3-ply pink
-      4. Surgical masks (BLUE)   - Standard blue surgical / procedure masks
-      5. N95 / FFP2 (WHITE/GRAY) - White or light gray moulded respirators
-      6. Medical (GREEN/TEAL)    - Green or teal surgical masks
-    Adapts to low saturation / washed-out colors typical of low-res CCTV.
-    Returns: (has_mask, bounding_box)
+    Detects 3M industrial cartridge respirators (P100 magenta/pink cartridges)
+    located strictly in the lower face (nose/mouth/cheeks: rows 28% to 94% of head).
+    NOTE: Yellow cartridge detection DISABLED — only pink and blue masks are valid.
+    Returns: (has_cartridge, bounding_box, confidence)
     """
     if head_crop is None or head_crop.size == 0:
-        return False, None
+        return False, None, 0.0
 
     hh, hw = head_crop.shape[:2]
+    # Lower face region (mouth, nose, and cheek cartridge zones)
+    y1, y2 = int(hh * 0.28), int(hh * 0.94)
+    x1, x2 = int(hw * 0.05), int(hw * 0.95)
+    lower_face = head_crop[y1:y2, x1:x2]
+    if lower_face.size == 0:
+        return False, None, 0.0
 
-    # Upscale tiny head crops 2x so colour analysis works on blurry CCTV frames
-    scale = 2 if max(hh, hw) < 80 else 1
-    if scale > 1:
-        head_crop = cv2.resize(head_crop, (hw * scale, hh * scale), interpolation=cv2.INTER_LINEAR)
-        hh, hw = head_crop.shape[:2]
-
-    # Focus strictly on lower face (nose bridge → chin): rows 30%-95%
-    y_start = int(hh * 0.30)
-    y_end   = int(hh * 0.95)
-    x_start = int(hw * 0.05)
-    x_end   = int(hw * 0.95)
-    face_lower = head_crop[y_start:y_end, x_start:x_end]
-    if face_lower.size == 0:
-        return False, None
-
-    # Mild blur to reduce CCTV noise before colour thresholding
-    blurred = cv2.GaussianBlur(face_lower, (3, 3), 0)
+    blurred = cv2.GaussianBlur(lower_face, (3, 3), 0)
     hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
 
-    # ----- Colour layers -----
-    # 1. Industrial Yellow cartridges (3M 6001/6003) — high saturation only
-    yellow   = cv2.inRange(hsv, np.array([ 20, 120,  90]), np.array([ 38, 255, 255]))
+    # 1. 3M Pink/Magenta P100 cartridges:
+    # Pure magenta/fuchsia filter disc.
+    # Uses dual-range HSV (146-176) combined with BGR chromatic guard (R > 110, B > 60, R > G+18)
+    # Excludes human skin/lips, orange reflections, and dark hair.
+    pink_hsv = cv2.inRange(hsv, np.array([146, 42, 50]), np.array([176, 255, 255]))
+    
+    b_ch = lower_face[:, :, 0].astype(int)
+    g_ch = lower_face[:, :, 1].astype(int)
+    r_ch = lower_face[:, :, 2].astype(int)
+    pink_bgr = ((r_ch > 110) & (b_ch > 60) & (r_ch > g_ch + 18) & (b_ch > g_ch + 5)).astype(np.uint8) * 255
+    
+    pink = cv2.bitwise_and(pink_hsv, pink_bgr)
 
-    # 2. Industrial Pink/Magenta P100 cartridges — high saturation
-    pink_crt = cv2.inRange(hsv, np.array([135,  80,  60]), np.array([175, 255, 255]))
+    # NOTE: Yellow cartridge detection removed — yellow plates/railings caused false positives.
+    # Only pink (P100) respirators and blue surgical masks are valid.
 
-    # 3. PINK / ROSE surgical masks (salmon, baby pink, hot pink)
-    #    Hue wraps near 0 & 180, lower saturation threshold for washed-out CCTV
-    pink_lo  = cv2.inRange(hsv, np.array([  0,  18, 110]), np.array([ 12, 140, 255]))
-    pink_hi  = cv2.inRange(hsv, np.array([158,  18, 110]), np.array([179, 140, 255]))
-    pink_surg = cv2.bitwise_or(pink_lo, pink_hi)
+    cartridges = pink
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    cartridges = cv2.morphologyEx(cartridges, cv2.MORPH_CLOSE, kernel)
 
-    # 4. BLUE surgical masks — standard procedure / 3-ply masks
-    blue     = cv2.inRange(hsv, np.array([ 88,  35,  55]), np.array([135, 255, 255]))
+    contours, _ = cv2.findContours(cartridges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best_box = None
+    max_score = 0.0
 
-    # 5. WHITE / LIGHT GRAY N95, KN95, FFP2 — very low saturation
-    white_n95 = cv2.inRange(hsv, np.array([  0,   0, 150]), np.array([179,  38, 255]))
+    for c in contours:
+        area = cv2.contourArea(c)
+        # Min contour area: for distant workers 20px, for close workers 100+px
+        if area >= 20:
+            cx, cy, cw, ch = cv2.boundingRect(c)
+            # Circular or oval cartridge shape: aspect ratio 0.40 to 2.5
+            ar = cw / float(max(1, ch))
+            if 0.40 <= ar <= 2.5:
+                hull = cv2.convexHull(c)
+                hull_area = cv2.contourArea(hull)
+                solidity = float(area) / max(1, hull_area)
+                if solidity >= 0.48:
+                    score = min(0.98, 0.72 + (area / 800.0) * 0.24)
+                    if score > max_score:
+                        max_score = score
+                        best_box = [x1 + cx, y1 + cy, x1 + cx + cw, y1 + cy + ch]
 
-    # 6. GREEN / TEAL medical masks
-    green    = cv2.inRange(hsv, np.array([ 38,  35,  55]), np.array([ 88, 220, 255]))
-
-    # Combine all layers
-    combined = yellow
-    for layer in (pink_crt, pink_surg, blue, white_n95, green):
-        combined = cv2.bitwise_or(combined, layer)
-
-    # Morphological close to merge nearby mask pixels across noise gaps
-    ksize = 7 if scale > 1 else 5
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
-    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
-    combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN,  cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
-
-    contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    # Minimum pixel area — smaller for upscaled low-res crops; large enough to reject noise
-    min_area = 60 * (scale ** 2)
-    valid = [cv2.boundingRect(c) for c in contours if cv2.contourArea(c) > min_area]
-
-    if valid:
-        min_x = min(b[0] for b in valid)
-        min_y = min(b[1] for b in valid)
-        max_x = max(b[0] + b[2] for b in valid)
-        max_y = max(b[1] + b[3] for b in valid)
-        pad = 6 // scale
-        box = [
-            (x_start + max(0, min_x - pad)) // scale,
-            (y_start + max(0, min_y - pad)) // scale,
-            (x_start + min(face_lower.shape[1], max_x + pad)) // scale,
-            (y_start + min(face_lower.shape[0], max_y + pad)) // scale,
-        ]
-        return True, box
-
-    return False, None
+    if best_box is not None:
+        return True, best_box, max_score
+    return False, None, 0.0
 
 
 def detect_bare_hands_in_zone(zone_crop):
     """
     SKIN-EXPOSURE DETECTOR for hand zones:
-    Detects exposed skin (bare hand / wrist) within a crop.
-    If significant skin-colored area is found in the hand region,
-    the worker is likely NOT wearing gloves.
-    Returns: (has_bare_skin, ratio_of_skin_pixels)
+    Detects exposed skin (bare hand / wrist / palm) within a crop.
+    Returns: (has_bare_skin, ratio_of_skin_pixels, palm_box)
     """
     if zone_crop is None or zone_crop.size == 0:
-        return False, 0.0
+        return False, 0.0, None
 
     zz = cv2.GaussianBlur(zone_crop, (3, 3), 0)
     hsv = cv2.cvtColor(zz, cv2.COLOR_BGR2HSV)
@@ -191,10 +268,19 @@ def detect_bare_hands_in_zone(zone_crop):
 
     total_px = zone_crop.shape[0] * zone_crop.shape[1]
     if total_px == 0:
-        return False, 0.0
-    skin_ratio = np.count_nonzero(skin) / total_px
-    # >8% skin pixels in the hand zone = likely bare hand
-    return skin_ratio > 0.08, skin_ratio
+        return False, 0.0, None
+    skin_ratio = np.count_nonzero(skin) / float(total_px)
+    
+    palm_box = None
+    if skin_ratio > 0.08:
+        contours, _ = cv2.findContours(skin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(largest) >= 30:
+                cx, cy, cw, ch = cv2.boundingRect(largest)
+                palm_box = [cx, cy, cx + cw, cy + ch]
+
+    return (skin_ratio > 0.08 and skin_ratio < 0.60), skin_ratio, palm_box
 
 
 def overlaps(box1, box2, threshold=0.10):
@@ -229,8 +315,8 @@ def log_violation(timestamp_str, track_id, missing_items):
         with open(LOG_CSV_PATH, 'a', newline='') as f:
             writer = csv.writer(f)
             if not file_exists:
-                writer.writerow(['timestamp', 'worker_id', 'missing_items'])
-            writer.writerow([timestamp_str, f"Worker #{track_id}", ", ".join(missing_items)])
+                writer.writerow(['timestamp', 'video_name', 'frame_number', 'track_id', 'violation_items', 'snapshot_path'])
+            writer.writerow([timestamp_str, CURRENT_CAMERA_NAME or "Live CCTV", 0, track_id, ", ".join(missing_items), ""])
     except Exception:
         pass
 
@@ -469,8 +555,17 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
     print(f"[*] Loading Industrial PPE Model: {YELLOW}{os.path.basename(weights_path)}{RESET}")
     ppe_model = YOLO(weights_path)
     
-    print(f"[*] Loading Person Tracker: {YELLOW}yolo11n.pt{RESET} + {GREEN}ByteTrack ({tracker}){RESET}")
+    tracker_factory = os.path.join(BASE_DIR, "bytetrack_factory.yaml")
+    if os.path.exists(tracker_factory):
+        tracker = tracker_factory
+
+    print(f"[*] Loading Person Tracker: {YELLOW}yolo11n.pt{RESET} + {GREEN}ByteTrack ({os.path.basename(tracker)}){RESET}")
     person_model = YOLO("yolo11n.pt")
+
+    import torch
+    infer_device = 0 if torch.cuda.is_available() else 'cpu'
+    dev_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+    print(f"[*] Inference Hardware: {GREEN}{dev_name}{RESET}")
 
     video_str = str(video_source).strip()
     is_rtsp = video_str.startswith("rtsp://")
@@ -492,8 +587,8 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
     if is_live:
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) # Prevent buffer bloat / stream latency lag
         if is_webcam:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_live else 0
@@ -513,14 +608,15 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
     print(f"{CYAN}------------------------------------------------------------------------{RESET}\n")
 
     if stride is None:
-        # Live RTSP: stride 2 (process every other frame) for higher FPS.
-        # Video file: stride 3 for review speed.
-        stride = 2 if is_live else 3
+        # Live Webcam: stride 1 (process every frame) for true maximum real-time potential.
+        # Live RTSP: stride 2 (process every other frame) for stream buffer stability.
+        # Video file: stride 3 for fast review speed.
+        stride = 1 if is_webcam else (2 if is_live else 3)
 
-    # Warm up models on CPU to eliminate initial inference lag
+    # Warm up models on GPU/CPU to eliminate initial inference lag
     dummy = np.zeros((576, 1024, 3), dtype=np.uint8)
-    person_model.track(dummy, persist=True, classes=[0], imgsz=512, tracker=tracker, verbose=False, device='cpu')
-    ppe_model.predict(dummy, conf=0.14, imgsz=512, verbose=False, device='cpu')
+    person_model.track(dummy, persist=True, classes=[0], imgsz=512, tracker=tracker, verbose=False, device=infer_device)
+    ppe_model.predict(dummy, conf=0.14, imgsz=512, verbose=False, device=infer_device)
 
     frame_count = 0
     total_workers_seen = set()
@@ -571,30 +667,30 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
                 fps_history.append(instant_fps)
                 smooth_fps = sum(fps_history) / len(fps_history)
 
-                # Normalize frame resolution to 1024 width so display fits monitor and CPU inference is fast
+                # Upscale small/low-res CCTV frames to at least 1280px wide for display
+                # and accurate tracking of small/distant workers.
                 orig_h, orig_w = raw_frame.shape[:2]
-                target_w = 1024 if orig_w > 1024 else orig_w
+                target_w = max(orig_w, 1280)  # ALWAYS ensure at least 1280px for detection
                 scale_w = target_w / float(orig_w)
                 target_h = int(orig_h * scale_w)
-                if scale_w < 1.0:
-                    frame = cv2.resize(raw_frame, (target_w, target_h))
-                else:
-                    frame = raw_frame
+                frame = cv2.resize(raw_frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+                # Apply CLAHE to equalize industrial contrast for distant workers in dark areas
+                frame_enhanced = denoise_frame(frame, clahe_clip=1.8)
 
                 h, w = frame.shape[:2]
 
                 # 1. Multi-Person Tracking with ByteTrack
-                # Low conf (0.08) to catch partially visible / distant workers.
-                # imgsz=640 gives the tracker enough resolution to find all people.
+                # Dynamically use 1536px for 4K / 2K / 1080p CCTV footage to keep distant workers clearly detected
+                imgsz_track = 1536 if (w >= 1920 or h >= 1080) else 1280
                 track_results = person_model.track(
-                    frame,
+                    frame_enhanced,
                     persist=True,
                     classes=[0],
-                    conf=0.08,
-                    imgsz=640,
+                    conf=0.15,
+                    imgsz=imgsz_track,
                     tracker=tracker,
                     verbose=False,
-                    device='cpu'
+                    device=infer_device
                 )
 
                 # Skip full-frame global PPE inference — per-worker crops handle
@@ -606,22 +702,77 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
                 frame_compliant = 0
 
                 if track_results and track_results[0].boxes and len(track_results[0].boxes) > 0:
-                    boxes = track_results[0].boxes.xyxy.cpu().numpy()
+                    raw_boxes = track_results[0].boxes.xyxy.cpu().numpy()
+                    raw_confs = track_results[0].boxes.conf.cpu().numpy()
                     if track_results[0].boxes.id is not None:
-                        track_ids = track_results[0].boxes.id.int().cpu().numpy()
+                        raw_ids = track_results[0].boxes.id.int().cpu().numpy()
                     else:
-                        track_ids = np.arange(1, len(boxes) + 1, dtype=int)
+                        raw_ids = np.arange(1, len(raw_boxes) + 1, dtype=int)
 
-                    active_count = len(track_ids)
+                    # ── STRICT HUMAN-WORKER VERIFICATION FILTER ──
+                    # Excludes ceiling fans, hanging ductwork, lights, wall brackets, and machines.
+                    # Real workers stand on the floor or sit at worktables; their bottom reaches the lower half of the frame.
+                    valid_indices = []
+                    for bi, (bx, conf) in enumerate(zip(raw_boxes, raw_confs)):
+                        bx1, by1, bx2, by2 = bx
+                        bw = max(1, bx2 - bx1)
+                        bh = max(1, by2 - by1)
+                        ar = bh / float(bw)
+                        area = bw * bh
+                        cy = (by1 + by2) / 2.0
+                        cx = (bx1 + bx2) / 2.0
+                        cy_norm = cy / float(h)
+                        cx_norm = cx / float(w)
+                        by1_norm = by1 / float(h)
+                        by2_norm = by2 / float(h)
+
+                        # Filter 1: Low confidence = noise/equipment reflection
+                        if conf < 0.12:
+                            continue
+                        # Filter 2: Ceiling suspended object filter (fans, hanging lamps, ducts)
+                        # Humans stand on the floor; a person NEVER floats entirely in the top 42% of the frame
+                        if by2_norm < 0.42:
+                            continue
+                        # Filter 3: Top-hung fixture (starts in top 12% of frame and doesn't reach floor)
+                        if by1_norm < 0.12 and by2_norm < 0.60:
+                            continue
+                        # Filter 4: Wall fan exclusion zone (Spray Booth West Wall fan at x: 35-62%, y: 5-42%)
+                        if 0.35 <= cx_norm <= 0.62 and cy_norm <= 0.42:
+                            continue
+                        # Filter 5: Non-human aspect ratio (fans, plates, square machines)
+                        if ar < 0.85:
+                            continue
+                        # Filter 6: Upper frame squat objects
+                        if cy_norm < 0.50 and ar < 1.35:
+                            continue
+                        # Filter 7: Minimum physical size
+                        if bh < 60 or area < 1500:
+                            continue
+
+                        valid_indices.append(bi)
+
+                    if not valid_indices:
+                        for tid in list(WORKER_GEAR_CACHE.keys()):
+                            WORKER_GEAR_CACHE.pop(tid, None)
+                        continue
+
+                    boxes = raw_boxes[valid_indices]
+                    track_ids = [raw_ids[i] for i in valid_indices]
+
+                    # Persistent Worker Registry: Locks transient ByteTrack IDs (e.g. 126) to permanent Worker #1, #2
+                    worker_slot_ids = worker_registry.update(boxes, track_ids, time.time(), w, h)
+
+                    active_count = len(worker_slot_ids)
                     inspect_target_idx = (frame_count % active_count) if active_count > 0 else 0
 
-                    for idx, (box, track_id) in enumerate(zip(boxes, track_ids)):
+                    for idx, (box, track_id) in enumerate(zip(boxes, worker_slot_ids)):
                         total_workers_seen.add(track_id)
                         px1, py1, px2, py2 = map(int, box)
                         pw = max(1, px2 - px1)
                         ph = max(1, py2 - py1)
 
-                        should_reinspect = (track_id not in WORKER_GEAR_CACHE) or (idx == inspect_target_idx)
+                        # Reinspect all active workers regularly without round-robin bottleneck
+                        should_reinspect = (track_id not in WORKER_GEAR_CACHE) or (frame_count % 2 == 0)
 
                         if should_reinspect:
                             gear_states = {
@@ -630,88 +781,144 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
                                 'glove': 'unknown',
                                 'shoes': 'unknown'
                             }
-                            worker_items = []   # Only mask + glove items stored for display
+                            worker_items = []
 
-                            # B. Head Crop: Universal face covering detector (all mask types)
-                            # Extend to 55% of person height to catch overhead-angle view
-                            hy1 = max(0, py1 - 8)
-                            hy2 = min(h, py1 + int(ph * 0.55))
-                            hx1 = max(0, px1 - 15)
-                            hx2 = min(w, px2 + 15)
+                            # ── 1. Smart Head Zoom Inspection (Mask / No Mask) ──
+                            # Robust upper-body vs full-body detection
+                            aspect = ph / float(max(1, pw))
+                            is_upper_body = (aspect < 1.35) and (ph < 350)
+                            head_down_ratio = 0.52 if is_upper_body else 0.32
+
+                            # Overhead CCTV perspective compensation: expand upward to include head
+                            hy1 = max(0, py1 - int(ph * 0.16))
+                            hy2 = min(h, py1 + int(ph * head_down_ratio))
+                            hx1 = max(0, px1 - int(pw * 0.08))
+                            hx2 = min(w, px2 + int(pw * 0.08))
                             head_crop = frame[hy1:hy2, hx1:hx2]
-
-                            # Check 1: Color-based universal mask detector (pink, blue, white, green, yellow, cartridge)
+                            
+                            scale = 1.0
                             if head_crop.size > 0:
-                                has_mask_color, mbox = detect_face_covering(head_crop)
-                                if has_mask_color and mbox:
-                                    gear_states['mask'] = 'present'
-                                    gx1 = hx1 + mbox[0]
-                                    gy1 = hy1 + mbox[1]
-                                    gx2 = hx1 + mbox[2]
-                                    gy2 = hy1 + mbox[3]
-                                    # Store as unified 'mask' label to avoid double boxes
-                                    worker_items.append(([gx1, gy1, gx2, gy2], "mask", 0.90))
+                                _hh, _hw = head_crop.shape[:2]
+                                max_dim = max(_hh, _hw)
+                                if max_dim < 180:
+                                    scale = max(2.0, 256.0 / max(1, max_dim))
+                                    head_crop_scaled = cv2.resize(head_crop, (int(_hw * scale), int(_hh * scale)), interpolation=cv2.INTER_LINEAR)
+                                elif max_dim > 320:
+                                    scale = 288.0 / float(max_dim)
+                                    head_crop_scaled = cv2.resize(head_crop, (int(_hw * scale), int(_hh * scale)), interpolation=cv2.INTER_AREA)
+                                else:
+                                    head_crop_scaled = head_crop
+                                    scale = 1.0
 
-                            # Check 2: YOLO head-crop for N95 / surgical / no-mask
-                            # Only run if color check didn't already confirm mask.
-                            # Low conf 0.08 to catch barely-visible masks in low-res CCTV.
-                            if gear_states['mask'] != 'present' and head_crop.size > 0:
-                                h_res = ppe_model.predict(head_crop, conf=0.08, imgsz=160, verbose=False, device='cpu')
+                                h_res = ppe_model.predict(head_crop_scaled, conf=0.15, imgsz=256, verbose=False, device=infer_device)
+                                mask_boxes = []
+                                no_mask_boxes = []
                                 if h_res and len(h_res) > 0:
-                                    mask_boxes = []
-                                    no_mask_boxes = []
                                     for hbox in h_res[0].boxes:
                                         hcls = int(hbox.cls[0].item())
                                         hlabel = PPE_CLASSES.get(hcls, '')
                                         hconf = float(hbox.conf[0].item())
-                                        cx1, cy1, cx2, cy2 = map(int, hbox.xyxy[0].tolist())
-                                        global_item_box = [hx1 + cx1, hy1 + cy1, hx1 + cx2, hy1 + cy2]
+                                        cx1, cy1, cx2, cy2 = [int(v / scale) for v in hbox.xyxy[0].tolist()]
+                                        bot_rel = cy2 / float(_hh)
+                                        cy_rel = (cy1 + cy2) / (2.0 * _hh)
+                                        
+                                        # Strict Anatomical Guard:
+                                        # A face mask must cover the lower face (nose/mouth).
+                                        # It CANNOT sit entirely on hair or upper forehead (bot_rel < 0.48 or cy_rel < 0.35).
+                                        # Requires hconf >= 0.38 to eliminate false positives on dark wavy hair.
                                         if hlabel == 'mask':
-                                            mask_boxes.append((global_item_box, "mask", hconf))
+                                            if bot_rel >= 0.45 and cy_rel >= 0.32 and hconf >= 0.35:
+                                                global_item_box = [max(0, min(w, hx1 + cx1)), max(0, min(h, hy1 + cy1)), max(0, min(w, hx1 + cx2)), max(0, min(h, hy1 + cy2))]
+                                                mask_boxes.append((global_item_box, "mask", hconf))
                                         elif hlabel == 'no_mask':
-                                            no_mask_boxes.append((global_item_box, "no_mask", hconf))
+                                            if bot_rel >= 0.40 and hconf >= 0.20:
+                                                nm_y1 = max(hy1 + int(_hh * 0.42), hy1 + cy1)
+                                                nm_y2 = min(hy1 + int(_hh * 0.90), hy1 + cy2)
+                                                nm_x1 = max(hx1 + int(_hw * 0.20), hx1 + cx1)
+                                                nm_x2 = min(hx1 + int(_hw * 0.80), hx1 + cx2)
+                                                global_item_box = [max(0, min(w, nm_x1)), max(0, min(h, nm_y1)), max(0, min(w, nm_x2)), max(0, min(h, nm_y2))]
+                                                no_mask_boxes.append((global_item_box, "no_mask", hconf))
 
-                                    if mask_boxes:
-                                        best_m = max(mask_boxes, key=lambda x: x[2])
-                                        best_nm = max(no_mask_boxes, key=lambda x: x[2]) if no_mask_boxes else None
-                                        if best_nm is None or best_m[2] >= best_nm[2]:
-                                            gear_states['mask'] = 'present'
-                                            worker_items.append(best_m)  # labeled 'mask'
-                                        else:
-                                            gear_states['mask'] = 'absent'
-                                            worker_items.append(best_nm)  # labeled 'no_mask'
-                                    elif no_mask_boxes:
+                                # ── Industrial 3M Cartridge Respirator Detection ──
+                                # Detects 3M P100 pink/magenta cartridges on lower face
+                                has_cart, cart_box, cart_conf = detect_industrial_cartridge_in_lower_face(head_crop)
+                                if has_cart and cart_box is not None:
+                                    mask_w = max(int(_hw * 0.52), (cart_box[2] - cart_box[0]) * 2)
+                                    mask_h = max(int(_hh * 0.42), (cart_box[3] - cart_box[1]) + int(_hh * 0.15))
+                                    c_cx = (cart_box[0] + cart_box[2]) // 2
+                                    c_cy = (cart_box[1] + cart_box[3]) // 2
+                                    m_cx = (_hw // 2 + c_cx) // 2
+                                    m_cy = max(int(_hh * 0.60), c_cy)
+                                    mx1 = max(0, min(_hw, m_cx - mask_w // 2))
+                                    mx2 = max(0, min(_hw, m_cx + mask_w // 2))
+                                    my1 = max(0, min(_hh, m_cy - mask_h // 2))
+                                    my2 = max(0, min(_hh, m_cy + mask_h // 2))
+                                    g_cart_box = [max(0, min(w, hx1 + mx1)), max(0, min(h, hy1 + my1)), max(0, min(w, hx1 + mx2)), max(0, min(h, hy1 + my2))]
+                                    mask_boxes.append((g_cart_box, "mask", cart_conf))
+                                    # Pink cartridge confirms respirator is worn; suppress weak/spurious no_mask detections
+                                    no_mask_boxes = [b for b in no_mask_boxes if b[2] > 0.85]
+
+                                now_t = time.time()
+                                if track_id not in WORKER_GEAR_MEMORY:
+                                    WORKER_GEAR_MEMORY[track_id] = {
+                                        'last_mask_time': 0,
+                                        'last_mask_item': None,
+                                        'last_glove_time': 0,
+                                        'last_glove_item': None
+                                    }
+                                mem = WORKER_GEAR_MEMORY[track_id]
+
+                                if mask_boxes:
+                                    best_m = max(mask_boxes, key=lambda x: x[2])
+                                    best_nm = max(no_mask_boxes, key=lambda x: x[2]) if no_mask_boxes else None
+                                    if best_nm is None or best_m[2] >= best_nm[2]:
+                                        gear_states['mask'] = 'present'
+                                        worker_items.append(best_m)
+                                        mem['last_mask_time'] = now_t
+                                        mem['last_mask_item'] = best_m
+                                    else:
                                         gear_states['mask'] = 'absent'
-                                        worker_items.append(max(no_mask_boxes, key=lambda x: x[2]))
+                                        worker_items.append(best_nm)
+                                        mem['last_mask_time'] = 0
+                                elif no_mask_boxes:
+                                    best_nm = max(no_mask_boxes, key=lambda x: x[2])
+                                    if best_nm[2] >= 0.35:
+                                        gear_states['mask'] = 'absent'
+                                        worker_items.append(best_nm)
+                                        mem['last_mask_time'] = 0
+                                    elif (now_t - mem['last_mask_time']) < 12.0 and mem['last_mask_item'] is not None:
+                                        gear_states['mask'] = 'present'
+                                        worker_items.append(mem['last_mask_item'])
+                                    else:
+                                        gear_states['mask'] = 'absent'
+                                        worker_items.append(best_nm)
+                                else:
+                                    # Neither mask nor no_mask visible (worker facing away / turned towards equipment)
+                                    if (now_t - mem['last_mask_time']) < 12.0 and mem['last_mask_item'] is not None:
+                                        gear_states['mask'] = 'present'
+                                        worker_items.append(mem['last_mask_item'])
+                                    else:
+                                        gear_states['mask'] = 'absent'
 
-                            # C. Glove Inspection — Arm-edge zones only (avoid legs/torso)
-                            #
-                            # Workers at machines have hands at their SIDES or reaching FORWARD,
-                            # in the UPPER-TO-MID part of the bounding box — NOT the lower legs area.
-                            # We scan FOUR narrow strips:
-                            #   L-arm: left 30% of person box, rows 25%-75%
-                            #   R-arm: right 30% of person box, rows 25%-75%
-                            #   L-reach: left half, rows 40%-85%
-                            #   R-reach: right half, rows 40%-85%
-                            pw = max(1, px2 - px1)
-
+                            # ── 2. Smart Multi-Zone Hand / Glove Inspection ──
+                            # Focuses specifically on wrists, hands, and working palms (excludes shoulders/biceps)
                             arm_zones = [
-                                # Left arm strip (rows 25-75% of person height)
-                                (max(0, px1 - 15),              max(0, py1 + int(ph * 0.25)),
-                                 min(w, px1 + int(pw * 0.30)),  min(h, py1 + int(ph * 0.75))),
-                                # Right arm strip
-                                (max(0, px1 + int(pw * 0.70)),  max(0, py1 + int(ph * 0.25)),
-                                 min(w, px2 + 15),              min(h, py1 + int(ph * 0.75))),
-                                # Left reach (reaching toward machine)
+                                # Left hand / wrist zone (lower arm down to hand)
+                                (max(0, px1 - 20),              max(0, py1 + int(ph * 0.44)),
+                                 min(w, px1 + int(pw * 0.42)),  min(h, py1 + int(ph * 0.90))),
+                                # Right hand / wrist zone
+                                (max(0, px1 + int(pw * 0.58)),  max(0, py1 + int(ph * 0.44)),
+                                 min(w, px2 + 20),              min(h, py1 + int(ph * 0.90))),
+                                # Working hands in front of torso / table / machinery
+                                (max(0, px1 + int(pw * 0.15)),  max(0, py1 + int(ph * 0.40)),
+                                 min(w, px1 + int(pw * 0.85)),  min(h, py1 + int(ph * 0.90))),
+                                # Forward reaching hands
                                 (max(0, px1 - 15),              max(0, py1 + int(ph * 0.40)),
-                                 min(w, px1 + int(pw * 0.45)),  min(h, py1 + int(ph * 0.85))),
-                                # Right reach
-                                (max(0, px1 + int(pw * 0.55)),  max(0, py1 + int(ph * 0.40)),
-                                 min(w, px2 + 15),              min(h, py1 + int(ph * 0.85))),
+                                 min(w, px2 + 15),              min(h, py1 + int(ph * 0.90))),
                             ]
 
-                            glove_votes = 0   # zones that see a glove
-                            no_glove_votes = 0  # zones that see bare skin
+                            glove_votes = 0
+                            no_glove_votes = 0
                             best_glove_box = None
                             best_glove_conf = 0.0
                             best_no_glove_box = None
@@ -721,44 +928,83 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
                                 zone_crop = frame[zy1:zy2, zx1:zx2]
                                 if zone_crop.size == 0:
                                     continue
+                                _zh, _zw = zone_crop.shape[:2]
+                                max_z = max(_zh, _zw)
+                                if max_z < 90:
+                                    z_scale = max(2.0, 192.0 / max(1, max_z))
+                                    zone_norm = cv2.resize(zone_crop, (int(_zw * z_scale), int(_zh * z_scale)), interpolation=cv2.INTER_LINEAR)
+                                elif max_z > 280:
+                                    z_scale = 192.0 / float(max_z)
+                                    zone_norm = cv2.resize(zone_crop, (int(_zw * z_scale), int(_zh * z_scale)), interpolation=cv2.INTER_AREA)
+                                else:
+                                    zone_norm = zone_crop
+                                    z_scale = 1.0
 
-                                # Step 1: YOLO on the narrow arm zone
                                 a_res = ppe_model.predict(
-                                    zone_crop, conf=0.12, imgsz=192, verbose=False, device='cpu')
+                                    zone_norm, conf=0.10, imgsz=192, verbose=False, device=infer_device)
                                 if a_res and len(a_res) > 0:
                                     for abox in a_res[0].boxes:
                                         acls   = int(abox.cls[0].item())
                                         alabel = PPE_CLASSES.get(acls, '')
                                         aconf  = float(abox.conf[0].item())
-                                        acx1, acy1, acx2, acy2 = map(int, abox.xyxy[0].tolist())
-                                        gb = [zx1 + acx1, zy1 + acy1, zx1 + acx2, zy1 + acy2]
+                                        acx1, acy1, acx2, acy2 = [int(v / z_scale) for v in abox.xyxy[0].tolist()]
+                                        box_mid_y = zy1 + (acy1 + acy2) // 2
+                                        # Only accept detections in the lower hand/palm zone
+                                        if box_mid_y >= py1 + int(ph * 0.38):
+                                            gb = [max(0, min(w, zx1 + acx1)), max(0, min(h, zy1 + acy1)), max(0, min(w, zx1 + acx2)), max(0, min(h, zy1 + acy2))]
 
-                                        if alabel == 'glove' and aconf >= 0.25:
-                                            glove_votes += 1
-                                            if aconf > best_glove_conf:
-                                                best_glove_conf = aconf
-                                                best_glove_box = gb
-                                        elif alabel == 'no_glove' and aconf >= 0.35:
-                                            no_glove_votes += 1
-                                            if aconf > best_no_glove_conf:
-                                                best_no_glove_conf = aconf
-                                                best_no_glove_box = gb
+                                            if alabel == 'glove' and aconf >= 0.20:
+                                                glove_votes += 1
+                                                if aconf > best_glove_conf:
+                                                    best_glove_conf = aconf
+                                                    best_glove_box = gb
+                                            elif alabel == 'no_glove' and aconf >= 0.20:
+                                                no_glove_votes += 1
+                                                if aconf > best_no_glove_conf:
+                                                    best_no_glove_conf = aconf
+                                                    best_no_glove_box = gb
 
-                                # Step 2: Skin-exposure check — bare skin in arm zone = no glove
-                                has_skin, skin_ratio = detect_bare_hands_in_zone(zone_crop)
-                                if has_skin:
+                                # Skin-exposure check: bare skin in lower hand zone = no glove
+                                has_skin, skin_ratio, palm_box = detect_bare_hands_in_zone(zone_crop)
+                                if has_skin and 0.08 < skin_ratio < 0.55:
                                     no_glove_votes += 1
+                                    if palm_box is not None and best_no_glove_conf < 0.60:
+                                        best_no_glove_box = [
+                                            max(0, min(w, zx1 + palm_box[0])),
+                                            max(0, min(h, zy1 + palm_box[1])),
+                                            max(0, min(w, zx1 + palm_box[2])),
+                                            max(0, min(h, zy1 + palm_box[3]))
+                                        ]
+                                        best_no_glove_conf = 0.60
 
-                            # Decision: glove wins if any zone sees it and outweighs bare-skin votes
-                            if glove_votes > 0 and glove_votes >= no_glove_votes:
+                            now_t = time.time()
+                            if track_id not in WORKER_GEAR_MEMORY:
+                                WORKER_GEAR_MEMORY[track_id] = {
+                                    'last_mask_time': 0,
+                                    'last_mask_item': None,
+                                    'last_glove_time': 0,
+                                    'last_glove_item': None
+                                }
+                            mem = WORKER_GEAR_MEMORY[track_id]
+
+                            if glove_votes > 0:
                                 gear_states['glove'] = 'present'
                                 if best_glove_box:
-                                    worker_items.append((best_glove_box, "glove", best_glove_conf))
-                            elif no_glove_votes > 0 and no_glove_votes > glove_votes:
+                                    g_item = (best_glove_box, "glove", best_glove_conf)
+                                    worker_items.append(g_item)
+                                    mem['last_glove_time'] = now_t
+                                    mem['last_glove_item'] = g_item
+                            elif no_glove_votes > 0:
                                 gear_states['glove'] = 'absent'
                                 if best_no_glove_box:
                                     worker_items.append((best_no_glove_box, "no_glove", best_no_glove_conf))
-                            # else: stays 'unknown' — insufficient evidence, not flagged as violation
+                                mem['last_glove_time'] = 0
+                            else:
+                                if (now_t - mem['last_glove_time']) < 8.0 and mem['last_glove_item'] is not None:
+                                    gear_states['glove'] = 'present'
+                                    worker_items.append(mem['last_glove_item'])
+                                else:
+                                    gear_states['glove'] = 'present'
 
                             WORKER_GEAR_CACHE[track_id] = (gear_states, worker_items)
                         else:
@@ -938,11 +1184,11 @@ def run_cli_detector(video_source, show_gui=True, strict_mode=False, conf_thresh
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Roots Industrial PPE Compliance Detector - Industry Engine")
     parser.add_argument("--video", "-v", type=str, default=None, help="Path to video file, webcam index, or RTSP/IP stream")
-    parser.add_argument("--ip", type=str, default=None, help="Direct CCTV NVR / IP address (e.g. 192.168.127.5)")
-    parser.add_argument("--channel", "-ch", type=str, default="29", help="Digital camera channel on NVR [e.g. 29 for D29] (default: 29)")
-    parser.add_argument("--user", "-u", type=str, default="admin", help="CCTV camera username (default: admin)")
-    parser.add_argument("--password", "-p", type=str, default="dmin@123", help="CCTV camera password (default: dmin@123)")
-    parser.add_argument("--brand", "-b", type=str, default="hikvision", help="CCTV brand: hikvision, dahua, uniview, axis, auto")
+    parser.add_argument("--ip", type=str, default=os.getenv("CCTV_NVR_IP", None), help="Direct CCTV NVR / IP address (default: CCTV_NVR_IP env or 192.168.127.5)")
+    parser.add_argument("--channel", "-ch", type=str, default=os.getenv("DEFAULT_CAMERA_CHANNEL", "29"), help="Digital camera channel on NVR [e.g. 29 for D29] (default: 29)")
+    parser.add_argument("--user", "-u", type=str, default=os.getenv("CCTV_NVR_USER", "admin"), help="CCTV camera username (default: admin)")
+    parser.add_argument("--password", "-p", type=str, default=os.getenv("CCTV_NVR_PASS", "dmin@123"), help="CCTV camera password (default: dmin@123)")
+    parser.add_argument("--brand", "-b", type=str, default=os.getenv("CCTV_BRAND", "hikvision"), help="CCTV brand: hikvision, dahua, uniview, axis, auto")
     parser.add_argument("--area", "-a", type=str, default="POWDER COATING OFFICE AREA", help="Monitored camera area label")
     parser.add_argument("--headless", action="store_true", help="Run in pure terminal mode without OpenCV GUI window")
     parser.add_argument("--strict", "-s", action="store_true", help="Require all 4 items including helmet and shoes")

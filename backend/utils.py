@@ -4,6 +4,7 @@ import os
 import time
 import csv
 import imageio
+import torch
 from collections import deque
 from datetime import datetime
 from ultralytics import YOLO
@@ -127,18 +128,18 @@ def overlaps(box1, box2, threshold=0.10):
 def detect_industrial_respirator(head_crop):
     """
     INDUSTRY-READY UNIVERSAL RESPIRATOR DETECTOR:
-    Detects factory half-face and full-face elastomeric respirators (3M 6000, 6200, 7500 series):
-    1. Yellow/Gold Organic Vapor cartridges (3M 6001/6003)
-    2. Pink/Magenta P100 Particulate cartridges (3M 2091/2097)
+    Detects factory half-face and full-face elastomeric respirators:
+    1. 3M P100 Particulate cartridges (3M 2091/2097 fuchsia/pink discs)
+    NOTE: Yellow cartridge detection DISABLED — only pink and blue masks are valid.
     Returns: (has_respirator, bounding_box, label_name)
     """
     if head_crop is None or head_crop.size == 0:
         return False, None, ""
         
     hh, hw = head_crop.shape[:2]
-    # Check lower 70% of head crop (nose bridge down to below chin)
-    y_start = int(hh * 0.25)
-    y_end = int(hh * 0.95)
+    # Check lower face region (nose bridge down to below chin)
+    y_start = int(hh * 0.28)
+    y_end = int(hh * 0.94)
     x_start = int(hw * 0.05)
     x_end = int(hw * 0.95)
     
@@ -146,33 +147,45 @@ def detect_industrial_respirator(head_crop):
     if face_lower.size == 0:
         return False, None, ""
         
-    hsv = cv2.cvtColor(face_lower, cv2.COLOR_BGR2HSV)
+    blurred = cv2.GaussianBlur(face_lower, (3, 3), 0)
+    hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
     
-    # 1. Industrial Yellow (Hue 25-36, Saturation >= 130 to reject all human skin tones)
-    yellow_mask = cv2.inRange(hsv, np.array([25, 130, 100]), np.array([36, 255, 255]))
-    contours_y, _ = cv2.findContours(yellow_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    y_boxes = [cv2.boundingRect(cnt) for cnt in contours_y if cv2.contourArea(cnt) > 150]
+    # 1. 3M Pink/Magenta P100 (Hue 146-176, Saturation >= 42, Value >= 50 + BGR chromatic guard)
+    pink_hsv = cv2.inRange(hsv, np.array([146, 42, 50]), np.array([176, 255, 255]))
+    b_ch = face_lower[:, :, 0].astype(int)
+    g_ch = face_lower[:, :, 1].astype(int)
+    r_ch = face_lower[:, :, 2].astype(int)
+    pink_bgr = ((r_ch > 110) & (b_ch > 60) & (r_ch > g_ch + 18) & (b_ch > g_ch + 5)).astype(np.uint8) * 255
+    pink_mask = cv2.bitwise_and(pink_hsv, pink_bgr)
     
-    # 2. Industrial Pink/Magenta P100 (Hue 138-172, Saturation >= 85 to reject lips/reflections)
-    pink_mask = cv2.inRange(hsv, np.array([138, 85, 60]), np.array([172, 255, 255]))
-    contours_p, _ = cv2.findContours(pink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    p_boxes = [cv2.boundingRect(cnt) for cnt in contours_p if cv2.contourArea(cnt) > 120]
-    
-    chosen_boxes = p_boxes if p_boxes else y_boxes
-    if chosen_boxes:
-        min_x = min(b[0] for b in chosen_boxes)
-        min_y = min(b[1] for b in chosen_boxes)
-        max_x = max(b[0] + b[2] for b in chosen_boxes)
-        max_y = max(b[1] + b[3] for b in chosen_boxes)
-        pad_x = max(8, int((max_x - min_x) * 0.15))
-        pad_y = max(8, int((max_y - min_y) * 0.15))
-        box = [
-            x_start + max(0, min_x - pad_x),
-            y_start + max(0, min_y - pad_y),
-            x_start + min(hw, max_x + pad_x),
-            y_start + min(hh, max_y + pad_y)
-        ]
-        return True, box, "respirator"
+    # NOTE: Yellow cartridge detection removed — yellow plates/railings caused false positives.
+    # Only pink (P100) respirators and blue surgical masks are valid.
+
+    cartridges = pink_mask
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    cartridges = cv2.morphologyEx(cartridges, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(cartridges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best_box = None
+    max_score = 0.0
+
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area >= 20:
+            cx, cy, cw, ch = cv2.boundingRect(c)
+            ar = cw / float(max(1, ch))
+            if 0.40 <= ar <= 2.5:
+                hull = cv2.convexHull(c)
+                hull_area = cv2.contourArea(hull)
+                solidity = float(area) / max(1, hull_area)
+                if solidity >= 0.48:
+                    score = min(0.98, 0.72 + (area / 800.0) * 0.24)
+                    if score > max_score:
+                        max_score = score
+                        best_box = [x_start + cx, y_start + cy, x_start + cx + cw, y_start + cy + ch]
+
+    if best_box is not None:
+        return True, best_box, "respirator"
 
     return False, None, ""
 
@@ -183,13 +196,15 @@ def detect_pink_respirator(head_crop):
 def inspect_worker_fused(frame, box_person, global_detections, ppe_model):
     """
     FUSED MULTI-SCALE INSPECTION:
-    Combines global frame YOLO detections, targeted 5x zoom crops,
+    Combines global frame YOLO detections, targeted zoom crops,
     and industrial pink respirator spatial verification.
     """
     h, w = frame.shape[:2]
     px1, py1, px2, py2 = map(int, box_person)
     pw = max(1, px2 - px1)
     ph = max(1, py2 - py1)
+
+    device = 0 if torch.cuda.is_available() else 'cpu'
 
     worker_item_boxes = []
     gear_states = {
@@ -225,11 +240,15 @@ def inspect_worker_fused(frame, box_person, global_detections, ppe_model):
             elif label == 'no_helmet' and gear_states['helmet'] != 'present':
                 gear_states['helmet'] = 'absent'
 
-    # 2. Zoomed Head / Face Inspection
-    hy1 = max(0, py1 - 10)
-    hy2 = min(h, py1 + int(ph * 0.35))
-    hx1 = max(0, px1 - 15)
-    hx2 = min(w, px2 + 15)
+    # 2. Zoomed Head / Face Inspection (Overhead perspective compensated)
+    aspect = ph / float(max(1, pw))
+    is_upper_body = (aspect < 1.35) and (ph < 350)
+    head_down_ratio = 0.52 if is_upper_body else 0.32
+
+    hy1 = max(0, py1 - int(ph * 0.16))
+    hy2 = min(h, py1 + int(ph * head_down_ratio))
+    hx1 = max(0, px1 - int(pw * 0.08))
+    hx2 = min(w, px2 + int(pw * 0.08))
     head_crop = frame[hy1:hy2, hx1:hx2]
 
     # Verify Pink Respirator in head crop
@@ -244,7 +263,7 @@ def inspect_worker_fused(frame, box_person, global_detections, ppe_model):
 
     # Zoomed Head Model Prediction
     if head_crop.size > 0 and gear_states['mask'] != 'present':
-        h_res = ppe_model.predict(head_crop, conf=0.08, verbose=False, device='cpu')
+        h_res = ppe_model.predict(head_crop, conf=0.08, verbose=False, device=device)
         if h_res and len(h_res) > 0:
             for box in h_res[0].boxes:
                 cls_id = int(box.cls[0].item())
@@ -264,14 +283,14 @@ def inspect_worker_fused(frame, box_person, global_detections, ppe_model):
                     gear_states['helmet'] = 'absent'
 
     # 3. Zoomed Hand / Arm Inspection
-    ay1 = max(0, py1 + int(ph * 0.25))
+    ay1 = max(0, py1 + int(ph * 0.35))
     ay2 = min(h, py1 + int(ph * 0.85))
     ax1 = max(0, px1 - 30)
     ax2 = min(w, px2 + 30)
     hands_crop = frame[ay1:ay2, ax1:ax2]
 
     if hands_crop.size > 0:
-        a_res = ppe_model.predict(hands_crop, conf=0.08, verbose=False, device='cpu')
+        a_res = ppe_model.predict(hands_crop, conf=0.08, verbose=False, device=device)
         if a_res and len(a_res) > 0:
             for box in a_res[0].boxes:
                 cls_id = int(box.cls[0].item())
@@ -294,7 +313,7 @@ def inspect_worker_fused(frame, box_person, global_detections, ppe_model):
     feet_crop = frame[fy1:fy2, fx1:fx2]
 
     if feet_crop.size > 0 and gear_states['shoes'] == 'unknown':
-        f_res = ppe_model.predict(feet_crop, conf=0.08, verbose=False, device='cpu')
+        f_res = ppe_model.predict(feet_crop, conf=0.08, verbose=False, device=device)
         if f_res and len(f_res) > 0:
             for box in f_res[0].boxes:
                 cls_id = int(box.cls[0].item())

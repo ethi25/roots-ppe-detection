@@ -34,3 +34,14 @@ backend/runs/
 backend/*backup*.pt
 backend/*clean*.pt
 backend/original_*.pt
+weights/
+
+# Temporary debug images and captures
+debug_*.*
+test_*.*
+cctv_live_*.*
+crop_*.*
+w1_*.*
+pipeline_*.*
+spray_booth_*.*
+

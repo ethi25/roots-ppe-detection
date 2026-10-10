@@ -3,6 +3,7 @@ import threading
 import shutil
 import csv
 import time
+import re
 import cv2
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -87,7 +88,48 @@ class ProcessVideoRequest(BaseModel):
     alert_threshold_frames: int = 5
     max_frames: int = 500  # For fast demo processing on large videos
 
+from streamer import get_pipeline, stream_state, PRESET_CAMERAS
+
 # Endpoints
+@app.get("/api/cctv-stream")
+def cctv_stream(camera: str = "d29", stride: int = 2):
+    pipeline = get_pipeline()
+    return StreamingResponse(
+        pipeline.generate_feed(camera_key=camera, stride=stride),
+        media_type="multipart/x-mixed-replace; boundary=frame"
+    )
+
+@app.get("/api/live-stats")
+def get_live_stats():
+    return {
+        "camera_name": stream_state.camera_name,
+        "camera_key": stream_state.camera_key,
+        "active_workers": stream_state.active_workers,
+        "compliant_workers": stream_state.compliant_workers,
+        "violating_workers": stream_state.violating_workers,
+        "compliance_rate": stream_state.compliance_rate,
+        "fps": stream_state.fps,
+        "device_name": stream_state.device_name,
+        "recent_events": list(stream_state.recent_events)
+    }
+
+@app.get("/api/cameras")
+def get_cameras():
+    return [
+        {"id": k, "name": v["name"]}
+        for k, v in PRESET_CAMERAS.items()
+    ]
+
+@app.get("/api/snapshot")
+def get_snapshot():
+    if stream_state.current_frame_jpeg is not None:
+        filename = f"snapshot_{int(time.time())}.jpg"
+        filepath = os.path.join(SNAPSHOTS_DIR, filename)
+        with open(filepath, "wb") as f:
+            f.write(stream_state.current_frame_jpeg)
+        return FileResponse(filepath, media_type="image/jpeg", filename=filename)
+    raise HTTPException(status_code=404, detail="No active frame available")
+
 @app.get("/api/stream-video")
 def stream_video(path: str):
     if not os.path.exists(path):
@@ -114,20 +156,69 @@ def get_status():
 
 @app.get("/api/violations")
 def get_violations():
-    """Reads violations from the CSV log and returns them."""
+    """Reads violations from the CSV log safely supporting all schema versions."""
     violations = []
-    if os.path.exists(CSV_LOG_PATH):
-        with open(CSV_LOG_PATH, 'r') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                violations.append({
-                    "timestamp": row.get("timestamp"),
-                    "video_name": row.get("video_name"),
-                    "frame_number": int(row.get("frame_number", 0)),
-                    "track_id": int(row.get("track_id", 0)),
-                    "violation_items": row.get("violation_items", "").split(","),
-                    "snapshot_path": row.get("snapshot_path")
-                })
+    if not os.path.exists(CSV_LOG_PATH):
+        return violations
+
+    try:
+        with open(CSV_LOG_PATH, 'r', encoding='utf-8', errors='ignore') as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+            if not rows:
+                return violations
+
+            header = [h.strip().lower() for h in rows[0]] if rows else []
+            for r in rows[1:]:
+                if not r or len(r) < 2:
+                    continue
+                # If 3-column format: timestamp, worker_id, missing_items
+                if len(r) == 3 and ('worker_id' in header or 'worker' in r[1].lower()):
+                    tid_match = re.search(r'\d+', r[1])
+                    tid = int(tid_match.group(0)) if tid_match else 1
+                    items = [x.strip() for x in r[2].split(',') if x.strip()]
+                    violations.append({
+                        "timestamp": r[0],
+                        "video_name": "Live CCTV",
+                        "frame_number": 0,
+                        "track_id": tid,
+                        "violation_items": items,
+                        "snapshot_path": ""
+                    })
+                # If standard format (5+ columns)
+                elif len(r) >= 5:
+                    ts = r[0]
+                    vname = r[1]
+                    try:
+                        fnum = int(float(r[2]))
+                    except (ValueError, TypeError):
+                        fnum = 0
+                    if len(r) >= 7:
+                        try:
+                            tid = int(float(r[4]))
+                        except (ValueError, TypeError):
+                            tid = 1
+                        items_str = r[5]
+                        snap = r[6] if len(r) > 6 else ""
+                    else:
+                        try:
+                            tid = int(float(r[3]))
+                        except (ValueError, TypeError):
+                            tid = 1
+                        items_str = r[4]
+                        snap = r[5] if len(r) > 5 else ""
+
+                    items = [x.strip() for x in items_str.split(',') if x.strip()]
+                    violations.append({
+                        "timestamp": ts,
+                        "video_name": vname,
+                        "frame_number": fnum,
+                        "track_id": tid,
+                        "violation_items": items,
+                        "snapshot_path": snap
+                    })
+    except Exception as e:
+        print(f"[!] Error reading violations log: {e}")
     return violations
 
 @app.post("/api/upload")
@@ -208,9 +299,9 @@ def run_train_bg(req: TrainRequest):
             )
 
         # Base PPE model path
-        base_model_path = "C:\\Users\\Ethirajan\\.gemini\\antigravity-ide\scratch\\yolov8n-ppe.pt"
+        base_model_path = os.path.join(BASE_DIR, "yolov8m-ppe.pt")
         if not os.path.exists(base_model_path):
-            base_model_path = os.path.join(BASE_DIR, "..", "yolov8n-ppe.pt")
+            base_model_path = os.path.join(BASE_DIR, "yolov8n-ppe.pt")
             if not os.path.exists(base_model_path):
                 # Fallback to downloading
                 import urllib.request
@@ -248,9 +339,9 @@ def run_process_video_bg(req: ProcessVideoRequest):
             with open(weights_file, 'r') as f:
                 model_path = f.read().strip()
         else:
-            model_path = "C:\\Users\\Ethirajan\\.gemini\\antigravity-ide\\scratch\\yolov8n-ppe.pt"
+            model_path = os.path.join(BASE_DIR, "yolov8m-ppe.pt")
             if not os.path.exists(model_path):
-                model_path = os.path.join(BASE_DIR, "..", "yolov8n-ppe.pt")
+                model_path = os.path.join(BASE_DIR, "yolov8n-ppe.pt")
 
         output_filename = f"processed_{int(time.time())}_{os.path.basename(req.video_path)}"
         # Sanitize filename (replace spaces)
